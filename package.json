@@ -1,0 +1,45 @@
+{
+  "name": "deepseek-token-meter",
+  "displayName": "DeepSeek 本机用量",
+  "description": "为 Trae CN / VS Code 提供本地 DeepSeek API 代理、每日模型 Token 统计与人民币费用估算。",
+  "version": "1.0.0",
+  "publisher": "local-tools",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://gitee.com/teddyFei/deepseek-token-meter.git" },
+  "bugs": { "url": "https://gitee.com/teddyFei/deepseek-token-meter/issues" },
+  "homepage": "https://gitee.com/teddyFei/deepseek-token-meter#readme",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "keywords": ["deepseek", "trae", "tokens", "usage", "proxy"],
+  "main": "./src/extension.js",
+  "icon": "media/icon.png",
+  "activationEvents": ["onStartupFinished"],
+  "capabilities": { "untrustedWorkspaces": { "supported": true }, "virtualWorkspaces": false },
+  "extensionKind": ["ui"],
+  "contributes": {
+    "commands": [
+      { "command": "deepseekTokenMeter.open", "title": "DeepSeek 本机用量：打开统计面板" },
+      { "command": "deepseekTokenMeter.start", "title": "DeepSeek 本机用量：启动本地代理" },
+      { "command": "deepseekTokenMeter.stop", "title": "DeepSeek 本机用量：停止本地代理" },
+      { "command": "deepseekTokenMeter.copyUrl", "title": "DeepSeek 本机用量：复制 Trae 请求地址" },
+      { "command": "deepseekTokenMeter.export", "title": "DeepSeek 本机用量：导出每日模型 CSV" }
+    ],
+    "viewsContainers": { "activitybar": [ { "id": "deepseekTokenMeter", "title": "DeepSeek 用量", "icon": "media/activity.svg" } ] },
+    "views": { "deepseekTokenMeter": [ { "id": "deepseekTokenMeter.welcome", "name": "本机统计" } ] },
+    "viewsWelcome": [ { "view": "deepseekTokenMeter.welcome", "contents": "记录经过本机代理的 DeepSeek API 用量。\n[打开统计面板](command:deepseekTokenMeter.open)\n[复制 Trae 请求地址](command:deepseekTokenMeter.copyUrl)\n[启动本地代理](command:deepseekTokenMeter.start)" } ],
+    "configuration": {
+      "title": "DeepSeek 本机用量",
+      "properties": {
+        "deepseekTokenMeter.port": { "type": "number", "default": 18765, "minimum": 1024, "maximum": 65535, "scope": "application", "description": "本机代理端口。修改前先停止旧代理，再重新启动。" },
+        "deepseekTokenMeter.autoStart": { "type": "boolean", "default": true, "scope": "application", "description": "启动编辑器时自动启动本机代理。" }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node scripts/check.js",
+    "package": "vsce package --no-dependencies --baseContentUrl https://gitee.com/teddyFei/deepseek-token-meter/blob/master --baseImagesUrl https://gitee.com/teddyFei/deepseek-token-meter/raw/master",
+    "preview": "node scripts/preview.js"
+  },
+  "devDependencies": { "@vscode/vsce": "^3.7.1", "@types/vscode": "^1.85.0" }
+}

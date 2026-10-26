@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!--CSP-->
+  <title>DeepSeek 本机用量</title>
+  <link rel="stylesheet" href="__STYLE_URI__">
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <div class="brand"><div class="brand-icon"><i></i><i></i><i></i><i></i></div><div><h1>DeepSeek <span>本机用量</span></h1><p>LOCAL TOKEN METER</p></div></div>
+      <div class="header-actions"><span id="preview-badge" hidden class="badge">演示数据</span><span class="service-pill" id="service-pill"><i></i><span>连接中</span></span><button class="icon-button" id="refresh" aria-label="刷新统计" title="刷新统计">↻</button></div>
+    </header>
+    <div class="nav-row"><nav><button class="nav-button selected" data-tab="overview">用量概览</button><button class="nav-button" data-tab="pricing">模型定价</button><button class="nav-button" data-tab="settings">接入设置</button></nav><span class="local-label"><span class="small-dot"></span> 数据仅保存在本机</span></div>
+    <div id="toast" role="status" hidden></div>
+    <section id="overview" class="tab-panel">
+      <div class="section-top"><div><h2>概览</h2><p id="range-caption">按请求开始时间统计 · Asia/Shanghai</p></div><div class="filter-group"><select id="model-filter" aria-label="筛选模型"><option value="">全部模型</option></select><div class="segments" id="ranges"><button data-range="10m">近10分钟</button><button data-range="1h">近1小时</button><button class="selected" data-range="today">近1自然日</button><button data-range="week">近一周</button><button data-range="month">近一个月</button><button data-range="custom">自定义</button></div></div></div>
+      <div class="custom-dates" id="custom-dates" hidden><label>开始 <input id="date-from" type="date"></label><label>结束 <input id="date-to" type="date"></label><button class="primary" id="apply-dates">应用日期</button></div>
+      <div class="chart-panel"><div class="chart-top"><span class="chart-title">Token 用量趋势</span><div class="legend"><span><i class="input-color"></i>输入（非缓存）</span><span><i class="cache-color"></i>缓存读取</span><span><i class="write-color"></i>缓存写入</span><span><i class="output-color"></i>输出</span></div></div><div class="chart-wrap" id="chart-wrap"><svg id="trend-chart" role="img" aria-label="不同时间的 Token 用量堆叠柱状图"></svg><div class="chart-tooltip" id="chart-tooltip" hidden></div></div><div class="chart-bottom"><span>单位：Tokens</span><span id="chart-source">来源：本机代理返回的 usage</span></div></div>
+      <div class="metrics"><article class="metric gauge-metric"><h3>缓存命中率 <span title="缓存读取 Tokens / 全部输入 Tokens；未返回 usage 的请求不参与计算">ⓘ</span></h3><div id="gauge"></div></article><article class="metric"><h3>LLM 调用 <span title="仅记录经过本机代理的模型生成请求，模型列表查询不计入">ⓘ</span></h3><strong id="requests">—</strong><p id="request-detail">成功 — / 异常 —</p></article><article class="metric"><h3>Token 消耗 <span title="输入已包含缓存部分，输出已包含推理 Tokens，不重复累计">ⓘ</span></h3><strong id="tokens">—</strong><p id="token-detail">输入 — / 输出 —</p></article><article class="metric"><h3>人民币估算 <span title="使用当前模型单价重新计算，不代表服务商的实扣账单">ⓘ</span></h3><strong id="cost">—</strong><p id="cost-detail">按当前单价估算</p></article></div>
+      <div class="notice-strip" id="data-notice" hidden></div>
+      <section class="activity-section"><div class="subheading"><h3>每日活跃</h3><span>最近 365 天 · 按 Token 总量</span></div><div class="heat-scroll"><div id="heatmap"></div></div><div class="heat-footer"><span id="activity-count">— 个活跃日</span><div>少 <i class="heat-zero"></i><i class="heat-one"></i><i class="heat-two"></i><i class="heat-three"></i><i class="heat-four"></i> 多</div></div></section>
+      <section class="model-section"><div class="subheading"><h3>模型用量</h3><button class="text-button" id="export">导出每日 CSV ↗</button></div><div class="table-scroll"><table><thead><tr><th>模型</th><th>调用</th><th>输入（非缓存）</th><th>缓存读取</th><th>缓存写入</th><th>输出</th><th>总 Tokens</th><th>估算 / 元</th></tr></thead><tbody id="model-rows"></tbody></table></div><div id="empty-guide" class="empty-guide" hidden><div class="empty-icon">↗</div><h3>从第一条 DeepSeek 请求开始</h3><p>将 Trae 自定义模型的请求地址改为本机代理，后续用量会自动记录。</p><button class="primary" id="empty-connect">查看接入步骤</button></div></section>
+      <section class="recent-section"><div class="subheading"><h3>最近请求</h3><span>最多显示 60 条 · 不保存对话内容</span></div><div class="table-scroll"><table><thead><tr><th>时间</th><th>模型</th><th>状态</th><th>总 Tokens</th><th>耗时</th></tr></thead><tbody id="recent-rows"></tbody></table></div></section>
+    </section>
+    <section id="pricing" class="tab-panel" hidden>
+      <div class="section-top"><div><h2>Token 定价</h2><p>为不同模型设置单价，单位：人民币 / 百万 Tokens。</p></div><button class="primary" id="save-prices">保存定价</button></div>
+      <div class="pricing-note">非缓存输入、缓存读取、缓存写入与输出独立计价。DeepSeek 的缓存未命中部分按“输入价格”计算，推理 Token 已包含在输出中。</div>
+      <div class="price-unit"><span>模型单价</span><span>CNY / 1M TOKENS</span></div>
+      <div class="table-scroll price-table"><table><thead><tr><th>模型 ID</th><th>输入价格</th><th>输出价格</th><th>缓存读取价格</th><th>缓存写入价格</th><th></th></tr></thead><tbody id="price-rows"></tbody></table></div>
+      <div class="add-price"><input id="new-model" list="known-models" placeholder="输入模型 ID，例如 deepseek-chat" aria-label="新增模型 ID"><datalist id="known-models"></datalist><button id="add-price">＋ 添加模型</button></div>
+      <p class="field-hint">可用末尾 * 匹配模型系列，例如 deepseek-*。优先匹配实际返回的模型 ID，其次匹配请求的模型 ID。未设置单价的模型仍统计 Token，费用显示为“未定价”。</p>
+      <div class="formula"><h3>人民币估算规则</h3><p>费用 =（非缓存输入 × 输入单价 + 缓存读取 × 读取单价 + 缓存写入 × 写入单价 + 输出 × 输出单价）÷ 1,000,000</p><p>调整单价后，历史记录也会按当前单价重新估算。默认不预填可能过期的官方价格，0 表示该项免费。</p></div>
+    </section>
+    <section id="settings" class="tab-panel" hidden>
+      <div class="section-top"><div><h2>接入 DeepSeek</h2><p>把自定义模型接到本机代理，保留 Trae 原有的对话和工具调用。</p></div><button class="secondary" id="toggle-service">启动代理</button></div>
+      <div class="setup-card"><div class="step-number">1</div><div class="step-content"><h3>复制本机请求地址</h3><div class="copy-line"><code id="base-url">http://127.0.0.1:18765/v1</code><button id="copy-url">复制地址</button></div><p>Trae → 设置 → 模型 → 添加模型 → 自定义模型</p></div></div>
+      <div class="setup-card"><div class="step-number">2</div><div class="step-content"><h3>填写 Trae 自定义模型</h3><dl class="setup-fields"><dt>API 格式</dt><dd>OpenAI Chat Completions 格式</dd><dt>完整 URL</dt><dd>关闭，基础地址粘贴上方地址</dd><dt>模型 ID</dt><dd>填写 DeepSeek 平台支持的实际模型 ID</dd><dt>API 密钥</dt><dd>填写你自己的 DeepSeek API Key</dd></dl><p>如果开启“完整 URL”，请使用 <code id="full-url">http://127.0.0.1:18765/v1/chat/completions</code> <button class="text-button" id="copy-full">复制</button></p></div></div>
+      <div class="setup-card"><div class="step-number">3</div><div class="step-content"><h3>配置单价并发起对话</h3><p>在“模型定价”中设置人民币单价，完成 Trae 连通性测试后开始使用。连通性测试也是真实调用，会计入本机用量。</p><p class="field-hint">只统计经过该地址的请求。Trae 内置云端模型、其他电脑及直接调用官方地址的请求不会被自动记录。历史用量可导入本插件的备份。</p></div></div>
+      <div class="settings-card"><div class="subheading"><h3>代理设置</h3><button class="primary" id="save-settings">保存设置</button></div><label class="field">上游 API 基础地址<input id="upstream" type="url" placeholder="https://api.deepseek.com"></label><p class="field-hint">默认直连 DeepSeek 官方 API。可填写兼容服务的基础地址，例如 https://example.com/v1；不要填写 /chat/completions，不在地址中放密钥。</p><label class="field">统计时区<input id="timezone" value="Asia/Shanghai" placeholder="Asia/Shanghai"></label><p class="field-hint">每日统计按此时区划分，默认北京时间；改变时区会重新汇总历史记录。</p><label class="checkbox-field"><input id="include-usage" type="checkbox"> 为流式请求补充 stream_options.include_usage</label><p class="field-hint">DeepSeek 官方接口本身会返回最终 usage，默认关闭。仅在兼容中转服务需要此参数时开启。</p></div>
+      <div class="settings-card"><div class="subheading"><h3>本地数据</h3><span>独立于当前项目</span></div><p id="data-directory" class="data-path"></p><div class="data-actions"><button id="backup">导出 JSON 备份</button><button id="import">导入备份</button><button id="open-data">打开数据目录</button></div><p class="field-hint">仅保存模型、时间、Token、状态和耗时，不保存 API Key、对话或响应正文。导入按记录 ID 去重，不覆盖当前单价；多个编辑器窗口共享同一个本机代理。</p></div>
+    </section>
+    <footer><span>DEEPSEEK LOCAL METER</span><span id="updated-at">等待本机数据</span></footer>
+  </div>
+  <script nonce="__NONCE__" src="__SCRIPT_URI__"></script>
+</body>
+</html>

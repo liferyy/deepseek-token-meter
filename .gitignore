@@ -1,0 +1,10 @@
+node_modules/
+*.vsix
+*.zip
+*.log
+preview-*.png
+coverage/
+.vscode-test/
+.DS_Store
+Thumbs.db
+*.tmp
