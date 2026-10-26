@@ -6,6 +6,8 @@ const path = require('node:path');
 const readline = require('node:readline');
 const { randomBytes } = require('node:crypto');
 const { DEFAULT_CONFIG, validateConfig } = require('./config');
+const { openDatabase, insertEvent, transaction, INSERT_SQL } = require('./db');
+const { rowToEvent } = require('./stats');
 
 async function atomicJson(file, object) {
   const temp = file + '.' + randomBytes(5).toString('hex') + '.tmp';
@@ -44,95 +46,82 @@ class Store {
   constructor(directory, port) {
     this.directory = directory;
     this.port = port;
+    this.memory = directory === ':memory:';
     this.config = structuredClone(DEFAULT_CONFIG);
-    this.events = [];
-    this.ids = new Set();
-    this.pending = Promise.resolve();
     this.warnings = [];
     this.revision = 0;
+    this.db = null;
+    this.insert = null;
   }
   async init() {
-    await fsp.mkdir(path.join(this.directory, 'events'), { recursive: true, mode: 0o700 });
+    if (this.memory) {
+      this.db = openDatabase(':memory:');
+      this.insert = this.db.prepare(INSERT_SQL);
+      return this;
+    }
+    await fsp.mkdir(this.directory, { recursive: true, mode: 0o700 });
     try { this.config = validateConfig(JSON.parse(await fsp.readFile(path.join(this.directory, 'config.json'), 'utf8')), this.port); }
     catch (error) {
       if (error.code !== 'ENOENT') throw new Error('本地配置读取失败，请检查 config.json：' + error.message);
       await atomicJson(path.join(this.directory, 'config.json'), this.config);
     }
-    const files = (await fsp.readdir(path.join(this.directory, 'events'))).filter(name => /^\d{4}-\d{2}\.jsonl$/.test(name)).sort();
-    for (const name of files) {
-      const file = path.join(this.directory, 'events', name);
-      const lines = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+    this.db = openDatabase(path.join(this.directory, 'usage.db'));
+    this.insert = this.db.prepare(INSERT_SQL);
+    await this.importLegacyJsonl();
+    return this;
+  }
+  // One-time upgrade from the old monthly JSONL files. The files are deleted only after the transaction commits,
+  // and INSERT OR IGNORE makes a retry after a crash safe.
+  async importLegacyJsonl() {
+    const directory = path.join(this.directory, 'events');
+    let names;
+    try { names = (await fsp.readdir(directory)).filter(name => /^\d{4}-\d{2}\.jsonl$/.test(name)).sort(); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    if (!names.length) return;
+    const events = [];
+    for (const name of names) {
+      const lines = readline.createInterface({ input: fs.createReadStream(path.join(directory, name)), crlfDelay: Infinity });
       let invalid = 0;
       for await (const line of lines) {
         if (!line.trim()) continue;
-        try { const event = cleanEvent(JSON.parse(line)); if (!this.ids.has(event.id)) { this.ids.add(event.id); this.events.push(event); } }
+        try { events.push(cleanEvent(JSON.parse(line))); }
         catch { invalid++; }
       }
       if (invalid) this.warnings.push(name + ' 有 ' + invalid + ' 行无法读取，其他记录已保留');
-      const handle = await fsp.open(file, 'r');
-      try {
-        const { size } = await handle.stat();
-        if (size) { const last = Buffer.alloc(1); await handle.read(last, 0, 1, size - 1); if (last[0] !== 10) await fsp.appendFile(file, '\n'); }
-      } finally { await handle.close(); }
     }
-    this.events.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
-    return this;
+    transaction(this.db, () => { for (const event of events) insertEvent(this.insert, event); });
+    // Another window may have migrated and deleted the same files first; that is not an error.
+    for (const name of names) await fsp.unlink(path.join(directory, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    if (events.length) this.revision++;
   }
-  enqueue(operation) {
-    const task = this.pending.then(operation);
-    this.pending = task.catch(() => {});
-    return task;
-  }
-  add(value) {
+  async add(value) {
     const event = cleanEvent(value);
-    return this.enqueue(async () => {
-      if (this.ids.has(event.id)) return false;
-      const file = path.join(this.directory, 'events', event.startedAt.slice(0, 7) + '.jsonl');
-      const handle = await fsp.open(file, 'a', 0o600);
-      try { await handle.write(JSON.stringify(event) + '\n'); await handle.sync(); } finally { await handle.close(); }
-      this.events.push(event); this.ids.add(event.id); this.revision++;
-      return true;
-    });
+    const added = insertEvent(this.insert, event) > 0;
+    if (added) this.revision++;
+    return added;
   }
-  saveConfig(value) {
+  async saveConfig(value) {
     const config = validateConfig(value, this.port);
-    return this.enqueue(async () => {
-      await atomicJson(path.join(this.directory, 'config.json'), config);
-      this.config = config;
-      this.revision++;
-      return config;
-    });
+    if (!this.memory) await atomicJson(path.join(this.directory, 'config.json'), config);
+    this.config = config;
+    this.revision++;
+    return config;
   }
   async importEvents(values) {
     if (!Array.isArray(values) || values.length > 50000) throw new Error('每次最多导入 50,000 条本插件格式的用量记录');
-    // Validate the whole file before touching the data directory so a bad row cannot cause a partial import.
+    // Validate the whole file before touching the database so a bad row cannot cause a partial import.
     const events = values.map(value => ({ ...cleanEvent(value), source: 'import' }));
-    return this.enqueue(async () => {
-      const added = [];
-      const files = new Map();
-      for (const event of events) {
-        if (this.ids.has(event.id)) continue;
-        this.ids.add(event.id);
-        added.push(event);
-        const file = path.join(this.directory, 'events', event.startedAt.slice(0, 7) + '.jsonl');
-        if (!files.has(file)) files.set(file, []);
-        files.get(file).push(event);
-      }
-      try {
-        // One append and one fsync per month keeps large backups fast without losing durability.
-        for (const [file, list] of files) {
-          const handle = await fsp.open(file, 'a', 0o600);
-          try { await handle.write(list.map(event => JSON.stringify(event) + '\n').join('')); await handle.sync(); } finally { await handle.close(); }
-        }
-      } catch (error) {
-        for (const event of added) this.ids.delete(event.id);
-        throw error;
-      }
-      this.events.push(...added); this.revision++;
-      return { added: added.length, skipped: values.length - added.length };
+    const added = transaction(this.db, () => {
+      let count = 0;
+      for (const event of events) count += insertEvent(this.insert, event);
+      return count;
     });
+    if (added) this.revision++;
+    return { added, skipped: values.length - added };
   }
-  async flush() { await this.pending; }
+  allEvents() { return this.db.prepare('SELECT * FROM events ORDER BY started_at').all().map(rowToEvent); }
+  async flush() { /* SQLite commits synchronously; kept for the shutdown sequence. */ }
+  close() { if (this.db) { this.db.close(); this.db = null; this.insert = null; } }
 }
 
 module.exports = { Store, cleanEvent, atomicJson };

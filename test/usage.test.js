@@ -3,12 +3,29 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { normalizeUsage, UsageCollector } = require('../src/usage');
 const { costFor, rateFor, validateConfig, DEFAULT_CONFIG } = require('../src/config');
+const { isPeak } = require('../src/peak');
 
 test('DeepSeek cache hits and reasoning are not double counted', () => {
   const usage = normalizeUsage({ prompt_tokens: 1000, prompt_cache_hit_tokens: 900, prompt_cache_miss_tokens: 100, completion_tokens: 200, completion_tokens_details: { reasoning_tokens: 150 }, total_tokens: 1200 });
   assert.deepEqual(usage, { input: 100, cacheRead: 900, cacheWrite: 0, output: 200, reasoning: 150, prompt: 1000, total: 1200 });
-  const cost = costFor(usage, { input: 2, cacheRead: .2, cacheWrite: 2, output: 8 });
-  assert.ok(Math.abs(cost.total - .00198) < 1e-10);
+  const rate = { input: 2, cacheRead: .2, cacheWrite: 2, output: 8 };
+  const peak = costFor(usage, rate, Date.parse('2026-10-26T02:00:00Z')); // 周一 10:00 北京时间
+  assert.equal(peak.peak, true); assert.ok(Math.abs(peak.total - .00198) < 1e-10);
+  const offPeak = costFor(usage, rate, Date.parse('2026-10-26T04:00:00Z')); // 周一 12:00 北京时间
+  assert.equal(offPeak.peak, false); assert.ok(Math.abs(offPeak.total - .00099) < 1e-10);
+});
+test('peak windows follow Beijing weekday hours and Chinese holidays', () => {
+  const at = value => Date.parse(value);
+  assert.equal(isPeak(at('2026-10-26T01:00:00Z')), true); // 周一 09:00
+  assert.equal(isPeak(at('2026-10-26T03:59:00Z')), true); // 周一 11:59
+  assert.equal(isPeak(at('2026-10-26T04:00:00Z')), false); // 12:00 午休
+  assert.equal(isPeak(at('2026-10-26T06:00:00Z')), true); // 14:00
+  assert.equal(isPeak(at('2026-10-26T10:00:00Z')), false); // 18:00
+  assert.equal(isPeak(at('2026-10-25T02:00:00Z')), false); // 周日
+  assert.equal(isPeak(at('2026-10-01T02:00:00Z')), false); // 国庆节（周四）
+  assert.equal(isPeak(at('2026-06-19T02:00:00Z')), false); // 端午节（周五）
+  assert.equal(isPeak(at('2026-02-16T02:00:00Z')), false); // 春节（周一）
+  assert.equal(isPeak(at('2025-10-09T02:00:00Z')), true); // 假期结束后的周四
 });
 test('cached details fallback and unknown usage', () => {
   assert.equal(normalizeUsage({ prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 80 }, completion_tokens: 4 }).input, 20);

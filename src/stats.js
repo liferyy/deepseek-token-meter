@@ -1,27 +1,24 @@
 'use strict';
 
-const { rateFor, costFor } = require('./config');
-const DAY = 86400000;
-const formatters = new Map();
-function dateParts(ms, zone) {
-  if (!formatters.has(zone)) formatters.set(zone, new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }));
-  return Object.fromEntries(formatters.get(zone).formatToParts(ms).filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
-}
-function dateKey(ms, zone) { const p = dateParts(ms, zone); return p.year + '-' + p.month + '-' + p.day; }
-function shiftDate(key, days) { return new Date(Date.parse(key + 'T12:00:00Z') + days * DAY).toISOString().slice(0, 10); }
-function midnight(key, zone) {
-  const target = Date.parse(key + 'T00:00:00Z');
-  if (!Number.isFinite(target)) throw new Error('日期无效');
-  let ms = target;
-  for (let i = 0; i < 4; i++) {
-    const p = dateParts(ms, zone);
-    const local = Date.parse(`${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}Z`);
-    const delta = target - local;
-    ms += delta;
-    if (!delta) break;
-  }
-  return ms;
-}
+// All aggregation runs inside SQLite: only per-day/model groups are read into memory, never every event.
+const { rateFor, costAt } = require('./config');
+const { isPeak } = require('./peak');
+const { DAY, dateParts, dateKey, midnight, shiftDate } = require('./time');
+
+const GROUP_COLUMNS = `
+  COUNT(*) AS requests,
+  SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+  SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+  SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+  SUM(CASE WHEN has_usage = 0 THEN 1 ELSE 0 END) AS missing_usage,
+  SUM(CASE WHEN has_usage = 1 AND partial = 1 THEN 1 ELSE 0 END) AS partial_usage,
+  SUM(has_usage) AS usage_requests,
+  SUM(CASE WHEN has_usage = 1 THEN input ELSE 0 END) AS input,
+  SUM(CASE WHEN has_usage = 1 THEN cache_read ELSE 0 END) AS cache_read,
+  SUM(CASE WHEN has_usage = 1 THEN cache_write ELSE 0 END) AS cache_write,
+  SUM(CASE WHEN has_usage = 1 THEN output ELSE 0 END) AS output,
+  SUM(CASE WHEN has_usage = 1 THEN reasoning ELSE 0 END) AS reasoning`;
+
 function makeRange(query, zone, now = Date.now()) {
   const today = dateKey(now, zone);
   const range = query.range || 'today';
@@ -41,76 +38,115 @@ function makeRange(query, zone, now = Date.now()) {
     label: range === 'today' ? '今日' : range === 'week' ? '近一周' : range === 'month' ? '近 30 天' : first + ' 至 ' + last };
 }
 function blank(extra = {}) { return { ...extra, requests: 0, success: 0, errors: 0, cancelled: 0, missingUsage: 0, partialUsage: 0, unpriced: 0,
-  input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, prompt: 0, total: 0, cost: 0, cacheCost: 0 }; }
-function accumulate(sum, event, config) {
-  sum.requests++;
-  if (event.status === 'success') sum.success++;
-  else if (event.status === 'cancelled') sum.cancelled++;
-  else sum.errors++;
-  if (!event.usage) { sum.missingUsage++; return; }
-  if (event.partial) sum.partialUsage++;
-  for (const key of ['input', 'cacheRead', 'cacheWrite', 'output', 'reasoning', 'prompt', 'total']) sum[key] += event.usage[key] || 0;
-  const cost = costFor(event.usage, rateFor(config.prices, event.model, event.requestedModel));
-  if (cost) { sum.cost += cost.total; sum.cacheCost += cost.cacheRead + cost.cacheWrite; }
-  else sum.unpriced++;
+  input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, prompt: 0, total: 0, cost: 0, costPeak: 0, costOffPeak: 0, cacheCost: 0 }; }
+
+function groupedRows(db, keyExpression, keyParams, from, to, model) {
+  const where = [], params = [...keyParams];
+  if (from != null) { where.push('started_at >= ?'); params.push(from); }
+  if (to != null) { where.push('started_at < ?'); params.push(to); }
+  if (model) { where.push('model = ?'); params.push(model); }
+  const sql = `SELECT ${keyExpression} AS bucket, model, requested_model, meter_peak(started_at) AS peak, ${GROUP_COLUMNS} FROM events` +
+    (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' GROUP BY bucket, model, requested_model, peak';
+  return db.prepare(sql).all(...params);
 }
-function summarize(events, config, query = {}, now = Date.now()) {
+
+function accumulateGroup(sum, row, prices) {
+  sum.requests += row.requests;
+  sum.success += row.success;
+  sum.errors += row.errors;
+  sum.cancelled += row.cancelled;
+  sum.missingUsage += row.missing_usage;
+  if (!row.usage_requests) return;
+  sum.partialUsage += row.partial_usage;
+  const usage = { input: row.input, cacheRead: row.cache_read, cacheWrite: row.cache_write, output: row.output, reasoning: row.reasoning };
+  for (const key of ['input', 'cacheRead', 'cacheWrite', 'output', 'reasoning']) sum[key] += usage[key];
+  usage.prompt = usage.input + usage.cacheRead + usage.cacheWrite;
+  usage.total = usage.prompt + usage.output;
+  sum.prompt += usage.prompt;
+  sum.total += usage.total;
+  const cost = costAt(usage, rateFor(prices, row.model, row.requested_model), row.peak === 1);
+  if (cost) {
+    sum.cost += cost.total;
+    if (cost.peak) sum.costPeak += cost.total; else sum.costOffPeak += cost.total;
+    sum.cacheCost += cost.cacheRead + cost.cacheWrite;
+  } else sum.unpriced += row.usage_requests;
+}
+
+function rowToEvent(row) {
+  const prompt = row.input + row.cache_read + row.cache_write;
+  return { id: row.id, startedAt: new Date(row.started_at).toISOString(), model: row.model, requestedModel: row.requested_model,
+    status: row.status, httpStatus: row.http_status, durationMs: row.duration_ms, endpoint: row.endpoint, source: row.source,
+    partial: row.partial === 1, errorCode: row.error_code,
+    usage: row.has_usage ? { input: row.input, cacheRead: row.cache_read, cacheWrite: row.cache_write, output: row.output,
+      reasoning: row.reasoning, prompt, total: prompt + row.output } : null };
+}
+
+function summarize(db, config, query = {}, now = Date.now()) {
   const zone = config.timezone;
   const range = makeRange(query, zone, now);
   const totals = blank();
   const models = new Map();
-  const bucketMap = new Map();
-  const buckets = [];
+  const buckets = [], bucketMap = new Map();
+  let bucketStart;
   if (range.mode === 'day') {
     for (let key = range.first; key <= range.last; key = shiftDate(key, 1)) {
       const bucket = blank({ key, label: key.slice(5), at: midnight(key, zone) });
       buckets.push(bucket); bucketMap.set(key, bucket);
     }
   } else {
-    const start = range.mode === 'hour' ? range.from : Math.floor(range.from / range.step) * range.step;
-    for (let at = start; at < range.to; at += range.step) {
+    bucketStart = range.mode === 'hour' ? range.from : Math.floor(range.from / range.step) * range.step;
+    for (let at = bucketStart; at < range.to; at += range.step) {
       const p = dateParts(at, zone), key = String(at);
       const bucket = blank({ key, label: p.hour + ':' + p.minute, at });
       buckets.push(bucket); bucketMap.set(key, bucket);
     }
   }
-  const today = dateKey(now, zone);
-  const heatFrom = shiftDate(today, -370);
-  const heatMap = new Map();
-  const recent = [];
-  for (const event of events) {
-    const ms = Date.parse(event.startedAt), day = dateKey(ms, zone);
-    if (day >= heatFrom && day <= today && (!query.model || event.model === query.model)) {
-      if (!heatMap.has(day)) heatMap.set(day, blank({ date: day }));
-      accumulate(heatMap.get(day), event, config);
-    }
-    if (ms < range.from || ms >= range.to || (query.model && event.model !== query.model)) continue;
-    accumulate(totals, event, config);
-    if (!models.has(event.model)) models.set(event.model, blank({ model: event.model, priced: Boolean(rateFor(config.prices, event.model, event.requestedModel)) }));
-    accumulate(models.get(event.model), event, config);
-    const bucketKey = range.mode === 'day' ? day : String(Math.floor((ms - (range.mode === 'hour' ? range.from : Math.floor(range.from / range.step) * range.step)) / range.step) * range.step + (range.mode === 'hour' ? range.from : Math.floor(range.from / range.step) * range.step));
-    if (bucketMap.has(bucketKey)) accumulate(bucketMap.get(bucketKey), event, config);
-    recent.push(event);
+  const keyExpression = range.mode === 'day' ? 'meter_day(started_at, ?)'
+    : range.mode === 'hour' ? 'CAST((started_at - ?) / 3600000 AS INTEGER)'
+      : 'CAST((started_at - ?) / ? AS INTEGER)';
+  const keyParams = range.mode === 'day' ? [zone] : range.mode === 'hour' ? [bucketStart] : [bucketStart, range.step];
+  for (const row of groupedRows(db, keyExpression, keyParams, range.from, range.to, query.model)) {
+    accumulateGroup(totals, row, config.prices);
+    if (!models.has(row.model)) models.set(row.model, blank({ model: row.model, priced: false }));
+    const model = models.get(row.model);
+    if (!model.priced) model.priced = Boolean(rateFor(config.prices, row.model, row.requested_model));
+    accumulateGroup(model, row, config.prices);
+    const bucketKey = range.mode === 'day' ? row.bucket : String(bucketStart + row.bucket * range.step);
+    if (bucketMap.has(bucketKey)) accumulateGroup(bucketMap.get(bucketKey), row, config.prices);
   }
   totals.cacheHitRate = totals.prompt ? totals.cacheRead / totals.prompt : null;
+
+  const today = dateKey(now, zone);
+  const heatMap = new Map();
+  const heatFrom = midnight(shiftDate(today, -370), zone);
+  const heatTo = midnight(shiftDate(today, 1), zone);
+  for (const row of groupedRows(db, 'meter_day(started_at, ?)', [zone], heatFrom, heatTo, query.model)) {
+    if (!heatMap.has(row.bucket)) heatMap.set(row.bucket, blank({ date: row.bucket }));
+    accumulateGroup(heatMap.get(row.bucket), row, config.prices);
+  }
   const heatmap = [];
   for (let key = shiftDate(today, -364); key <= today; key = shiftDate(key, 1)) heatmap.push(heatMap.get(key) || blank({ date: key }));
+
+  const recent = db.prepare('SELECT * FROM events WHERE started_at >= ? AND started_at < ?' + (query.model ? ' AND model = ?' : '') +
+    ' ORDER BY started_at DESC, id DESC LIMIT 60').all(...(query.model ? [range.from, range.to, query.model] : [range.from, range.to]))
+    .map(row => ({ ...rowToEvent(row), peak: isPeak(row.started_at) }));
+  const allModels = db.prepare('SELECT DISTINCT model FROM events ORDER BY model').all().map(row => row.model);
   return { range, timezone: zone, totals, buckets, models: [...models.values()].sort((a, b) => b.total - a.total),
-    allModels: [...new Set(events.map(e => e.model))].sort(), heatmap,
-    recent: recent.sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 60), generatedAt: new Date(now).toISOString() };
+    allModels, heatmap, recent, generatedAt: new Date(now).toISOString() };
 }
 
-function dailyCsv(events, config) {
+function dailyCsv(db, config) {
   const rows = new Map();
-  for (const event of events) {
-    const date = dateKey(Date.parse(event.startedAt), config.timezone), key = date + '\0' + event.model;
-    if (!rows.has(key)) rows.set(key, blank({ date, model: event.model }));
-    accumulate(rows.get(key), event, config);
+  for (const row of groupedRows(db, 'meter_day(started_at, ?)', [config.timezone], null, null, null)) {
+    const key = row.bucket + '\0' + row.model;
+    if (!rows.has(key)) rows.set(key, blank({ date: row.bucket, model: row.model }));
+    accumulateGroup(rows.get(key), row, config.prices);
   }
-  const fields = ['date', 'model', 'requests', 'success', 'errors', 'cancelled', 'input', 'cacheRead', 'cacheWrite', 'output', 'reasoning', 'total', 'missingUsage', 'partialUsage', 'unpriced', 'cost'];
-  const headers = ['日期', '模型', '请求次数', '成功', '异常', '取消', '非缓存输入Tokens', '缓存读取Tokens', '缓存写入Tokens', '输出Tokens', '推理Tokens_已含于输出', '总Tokens', '无用量请求', '部分用量请求', '未定价请求', '已定价部分估算人民币_按当前价格'];
+  const fields = ['date', 'model', 'requests', 'success', 'errors', 'cancelled', 'input', 'cacheRead', 'cacheWrite', 'output', 'reasoning', 'total', 'missingUsage', 'partialUsage', 'unpriced', 'cost', 'costPeak', 'costOffPeak'];
+  const headers = ['日期', '模型', '请求次数', '成功', '异常', '取消', '非缓存输入Tokens', '缓存读取Tokens', '缓存写入Tokens', '输出Tokens', '推理Tokens_已含于输出', '总Tokens', '无用量请求', '部分用量请求', '未定价请求', '已定价部分估算人民币_按当前价格', '其中高峰时段估算人民币', '其中空闲时段估算人民币'];
+  const moneyKeys = ['cost', 'costPeak', 'costOffPeak'];
   const escape = value => { let text = String(value ?? ''); if (/^[=+\-@\t\r]/.test(text)) text = "'" + text; return '"' + text.replace(/"/g, '""') + '"'; };
-  return '\ufeff' + headers.map(escape).join(',') + '\r\n' + [...rows.values()].sort((a, b) => a.date.localeCompare(b.date) || a.model.localeCompare(b.model)).map(row => fields.map(k => escape(k === 'cost' ? row.cost.toFixed(8) : row[k])).join(',')).join('\r\n') + '\r\n';
+  return '\ufeff' + headers.map(escape).join(',') + '\r\n' + [...rows.values()].sort((a, b) => a.date.localeCompare(b.date) || a.model.localeCompare(b.model)).map(row => fields.map(k => escape(moneyKeys.includes(k) ? row[k].toFixed(8) : row[k])).join(',')).join('\r\n') + '\r\n';
 }
 
-module.exports = { summarize, dailyCsv, dateKey, midnight, makeRange, shiftDate, blank };
+module.exports = { summarize, dailyCsv, rowToEvent, dateKey, midnight, makeRange, shiftDate, blank };

@@ -8,7 +8,7 @@
   "repository": { "type": "git", "url": "https://gitee.com/teddyFei/deepseek-token-meter.git" },
   "bugs": { "url": "https://gitee.com/teddyFei/deepseek-token-meter/issues" },
   "homepage": "https://gitee.com/teddyFei/deepseek-token-meter#readme",
-  "engines": { "vscode": "^1.85.0" },
+  "engines": { "vscode": "^1.107.0" },
   "categories": ["Other"],
   "keywords": ["deepseek", "trae", "tokens", "usage", "proxy"],
   "main": "./src/extension.js",
@@ -38,7 +38,7 @@
   "scripts": {
     "test": "node --test",
     "check": "node scripts/check.js",
-    "package": "vsce package --no-dependencies --baseContentUrl https://gitee.com/teddyFei/deepseek-token-meter/blob/master --baseImagesUrl https://gitee.com/teddyFei/deepseek-token-meter/raw/master",
+    "package": "node scripts/bump-version.js && vsce package --no-dependencies --baseContentUrl https://gitee.com/teddyFei/deepseek-token-meter/blob/master --baseImagesUrl https://gitee.com/teddyFei/deepseek-token-meter/raw/master",
     "preview": "node scripts/preview.js"
   },
   "devDependencies": { "@vscode/vsce": "^3.7.1", "@types/vscode": "^1.85.0" }

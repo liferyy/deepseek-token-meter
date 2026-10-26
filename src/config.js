@@ -1,6 +1,10 @@
 'use strict';
 
-const DEFAULT_CONFIG = Object.freeze({ upstream: 'https://api.deepseek.com', timezone: 'Asia/Shanghai', includeUsage: false, prices: [] });
+// Default prices follow DeepSeek's peak-hour CNY pricing for deepseek-flash (cache write is free).
+const { isPeak, OFF_PEAK_FACTOR } = require('./peak');
+
+const DEFAULT_CONFIG = Object.freeze({ upstream: 'https://api.deepseek.com', timezone: 'Asia/Shanghai', includeUsage: false,
+  prices: [{ model: 'deepseek-flash', input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 }] });
 const PRICE_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'];
 
 function validateConfig(value, port) {
@@ -34,10 +38,13 @@ function rateFor(prices, model, requestedModel) {
   const patterns = prices.filter(row => row.model.endsWith('*')).sort((a, b) => b.model.length - a.model.length);
   return patterns.find(row => model.startsWith(row.model.slice(0, -1)) || (requestedModel || '').startsWith(row.model.slice(0, -1))) || null;
 }
-function costFor(usage, rate) {
+// Configured prices are peak-hour prices; off-peak requests pay half.
+function costAt(usage, rate, peak) {
   if (!usage || !rate) return null;
-  const parts = Object.fromEntries(PRICE_KEYS.map(key => [key, usage[key] * rate[key] / 1000000]));
-  return { ...parts, total: Object.values(parts).reduce((a, b) => a + b, 0) };
+  const factor = peak ? 1 : OFF_PEAK_FACTOR;
+  const parts = Object.fromEntries(PRICE_KEYS.map(key => [key, usage[key] * rate[key] * factor / 1000000]));
+  return { ...parts, total: Object.values(parts).reduce((a, b) => a + b, 0), peak };
 }
+function costFor(usage, rate, at) { return costAt(usage, rate, isPeak(at)); }
 
-module.exports = { DEFAULT_CONFIG, PRICE_KEYS, validateConfig, rateFor, costFor };
+module.exports = { DEFAULT_CONFIG, PRICE_KEYS, validateConfig, rateFor, costFor, costAt };

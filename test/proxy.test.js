@@ -55,7 +55,7 @@ async function setup(t, options = {}) {
   const token = randomBytes(32).toString('hex');
   const meter = createMeterServer({ store, token, port: 0, fingerprint: 'test' });
   const port = await listen(meter.server);
-  t.after(async () => { await meter.close(); await close(upstream); await fs.rm(directory, { recursive: true, force: true }); });
+  t.after(async () => { await meter.close(); store.close(); await close(upstream); await fs.rm(directory, { recursive: true, force: true }); });
   return { store, meter, port, token, seen, received: () => received };
 }
 
@@ -78,8 +78,8 @@ test('proxy streams SSE upstream unchanged and records the final cumulative usag
   assert.equal(ctx.received(), 1);
   assert.equal(ctx.seen[0].url, '/chat/completions');
   assert.equal(ctx.seen[0].headers.authorization, 'Bearer sk-test');
-  assert.equal(ctx.store.events.length, 1);
-  const event = ctx.store.events[0];
+  assert.equal(ctx.store.allEvents().length, 1);
+  const event = ctx.store.allEvents()[0];
   assert.equal(event.status, 'success');
   assert.equal(event.model, 'deepseek-chat');
   assert.equal(event.endpoint, 'chat');
@@ -104,10 +104,10 @@ test('proxy adds include_usage when enabled, decodes gzip usage and preserves th
   assert.equal(response.status, 200);
   assert.equal(response.headers['content-encoding'], 'gzip');
   assert.equal(JSON.parse(zlib.gunzipSync(response.body).toString('utf8')).model, 'deepseek-reasoner');
-  assert.equal(ctx.store.events.length, 1);
-  assert.equal(ctx.store.events[0].requestedModel, 'deepseek-chat');
-  assert.equal(ctx.store.events[0].usage.total, 70);
-  assert.equal(ctx.store.events[0].usage.reasoning, 10);
+  assert.equal(ctx.store.allEvents().length, 1);
+  assert.equal(ctx.store.allEvents()[0].requestedModel, 'deepseek-chat');
+  assert.equal(ctx.store.allEvents()[0].usage.total, 70);
+  assert.equal(ctx.store.allEvents()[0].usage.reasoning, 10);
 });
 
 test('proxy records upstream HTTP failures without inventing token usage', async t => {
@@ -121,11 +121,11 @@ test('proxy records upstream HTTP failures without inventing token usage', async
   const response = await request(ctx.port, { body: { model: 'deepseek-chat', messages: [] } });
   assert.equal(response.status, 401);
   assert.equal(JSON.parse(response.body.toString('utf8')).error.message, 'invalid key');
-  assert.equal(ctx.store.events.length, 1);
-  assert.equal(ctx.store.events[0].status, 'error');
-  assert.equal(ctx.store.events[0].httpStatus, 401);
-  assert.equal(ctx.store.events[0].errorCode, 'API_ERROR');
-  assert.equal(ctx.store.events[0].usage, null);
+  assert.equal(ctx.store.allEvents().length, 1);
+  assert.equal(ctx.store.allEvents()[0].status, 'error');
+  assert.equal(ctx.store.allEvents()[0].httpStatus, 401);
+  assert.equal(ctx.store.allEvents()[0].errorCode, 'API_ERROR');
+  assert.equal(ctx.store.allEvents()[0].usage, null);
 });
 
 test('local-only guard, route validation and API key requirement run before any upstream call', async t => {
@@ -151,6 +151,11 @@ test('admin endpoints require the private token and never expose it', async t =>
   assert.equal(payload.service.running, true);
   assert.equal(payload.totals.requests, 0);
   assert.ok(!JSON.stringify(payload).includes(ctx.token));
+  await ctx.store.add({ id: 'backup_1', startedAt: '2026-10-26T09:00:00Z', model: 'deepseek-chat', status: 'success',
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0 } });
+  const backup = JSON.parse((await request(ctx.port, { path: '/_meter/backup', headers: { 'x-meter-token': ctx.token } })).body.toString('utf8'));
+  assert.equal(backup.format, 'deepseek-token-meter');
+  assert.deepEqual(backup.events.map(event => event.id), ['backup_1']);
   assert.equal((await request(ctx.port, { path: '/_meter/export', headers: { 'x-meter-token': ctx.token } })).status, 200);
   assert.equal((await request(ctx.port, { method: 'POST', path: '/_meter/import', headers: { 'x-meter-token': ctx.token }, body: { format: 'other' } })).status, 400);
   assert.equal((await request(ctx.port, { path: '/_meter/backup', headers: { 'x-meter-token': ctx.token.toUpperCase() } })).status, 401);
@@ -176,10 +181,10 @@ test('client cancellation stops the upstream stream and records partial usage as
     req.once('error', reject);
     req.end(body);
   });
-  for (let i = 0; i < 100 && !ctx.store.events.length; i++) await new Promise(resolve => setTimeout(resolve, 20));
+  for (let i = 0; i < 100 && !ctx.store.allEvents().length; i++) await new Promise(resolve => setTimeout(resolve, 20));
   release();
-  assert.equal(ctx.store.events.length, 1);
-  const event = ctx.store.events[0];
+  assert.equal(ctx.store.allEvents().length, 1);
+  const event = ctx.store.allEvents()[0];
   assert.equal(event.status, 'cancelled');
   assert.equal(event.errorCode, 'CLIENT_CANCELLED');
   assert.equal(event.partial, true);

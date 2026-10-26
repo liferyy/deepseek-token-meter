@@ -16,10 +16,11 @@ function freePort() {
   });
 }
 
-test('stopped proxy keeps one local store across status polls instead of re-reading every JSONL file', async t => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-client-')); t.after(() => fs.rm(directory, { recursive: true, force: true }));
+test('stopped proxy keeps one local store across status polls instead of reopening the database', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-client-'));
   const port = await freePort();
   const client = await new ServiceClient(directory, path.join(__dirname, '..'), port).init();
+  t.after(async () => { client.close(); await fs.rm(directory, { recursive: true, force: true }); });
   const original = Store.prototype.init;
   let reads = 0;
   Store.prototype.init = function init() { reads++; return original.call(this); };

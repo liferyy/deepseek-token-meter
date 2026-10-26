@@ -7,6 +7,7 @@ const path = require('node:path');
 const { randomBytes } = require('node:crypto');
 const { summarize, dailyCsv, dateKey, midnight, shiftDate } = require('../src/stats');
 const { DEFAULT_CONFIG, validateConfig } = require('../src/config');
+const { Store } = require('../src/store');
 
 const media = path.join(__dirname, '..', 'media');
 const port = Number(process.env.PREVIEW_PORT || 18766);
@@ -17,6 +18,7 @@ let config = { ...structuredClone(DEFAULT_CONFIG), prices: [
   { model: 'deepseek-reasoner', input: 4, output: 16, cacheRead: .4, cacheWrite: 0 }
 ] };
 let running = true;
+let store, emptyStore;
 let seed = 20261026;
 function rand() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
 function demoEvents() {
@@ -39,7 +41,6 @@ function demoEvents() {
   for (let i = 19; i >= 0; i--) add(now - i * 96000 - 10000, result.length);
   return result;
 }
-const events = demoEvents();
 const bridge = `
 <script>
 (() => {
@@ -73,16 +74,16 @@ const server = http.createServer(async (req, res) => {
       if (req.headers['x-preview-token'] !== token) { res.writeHead(403).end(); return; }
       let body = '';
       for await (const chunk of req) { body += chunk; if (body.length > 512000) { res.writeHead(413).end(); return; } }
-      const message = JSON.parse(body), selectedEvents = message.empty ? [] : events;
+      const message = JSON.parse(body), db = message.empty ? emptyStore.db : store.db;
       if (message.type === 'saveConfig') config = validateConfig(message.value, 18765);
       if (message.type === 'stop') running = false;
       if (message.type === 'start') running = true;
-      const state = { ...summarize(selectedEvents, config, message.query), config,
+      const state = { ...summarize(db, config, message.query), config,
         service: { running, active: 0, port: 18765, dataDirectory: '演示模式：数据仅在内存，不读取或写入真实用量' },
         warnings: ['演示数据与演示单价，仅用于预览界面；不代表真实消耗或官方价格。此端口不代理任何模型请求。'] };
       const result = { state, saved: message.type === 'saveConfig' };
-      if (message.type === 'export') Object.assign(result, { download: dailyCsv(selectedEvents, config), name: 'DEMO-deepseek-daily.csv', mime: 'text/csv;charset=utf-8' });
-      if (message.type === 'backup') Object.assign(result, { download: JSON.stringify({ format: 'deepseek-token-meter-preview', demo: true, config, events: selectedEvents }, null, 2), name: 'DEMO-preview.json', mime: 'application/json' });
+      if (message.type === 'export') Object.assign(result, { download: dailyCsv(db, config), name: 'DEMO-deepseek-daily.csv', mime: 'text/csv;charset=utf-8' });
+      if (message.type === 'backup') Object.assign(result, { download: JSON.stringify({ format: 'deepseek-token-meter-preview', demo: true, config, events: db.allEvents() }, null, 2), name: 'DEMO-preview.json', mime: 'application/json' });
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' }).end(JSON.stringify(result)); return;
     }
     if (req.method !== 'GET') { res.writeHead(405).end(); return; }
@@ -95,12 +96,18 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404).end();
   } catch (error) { if (!res.headersSent) res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify({ error: error.message })); }
 });
-server.on('error', error => {
-  console.error(error.code === 'EADDRINUSE' ? `预览端口 ${port} 已占用。可直接打开现有预览，或设置 PREVIEW_PORT 后重试。` : error.message);
-  process.exitCode = 1;
-});
-server.listen(port, '127.0.0.1', () => {
-  console.log(`DeepSeek 界面预览：http://127.0.0.1:${port}`);
-  console.log(`空数据预览：http://127.0.0.1:${port}/?empty=1`);
-  console.log('仅使用演示数据与单价，不调用 DeepSeek，不消耗 Token。按 Ctrl+C 退出。');
-});
+async function main() {
+  store = await new Store(':memory:', 18765).init();
+  emptyStore = await new Store(':memory:', 18765).init();
+  for (const event of demoEvents()) await store.add(event);
+  server.on('error', error => {
+    console.error(error.code === 'EADDRINUSE' ? `预览端口 ${port} 已占用。可直接打开现有预览，或设置 PREVIEW_PORT 后重试。` : error.message);
+    process.exitCode = 1;
+  });
+  server.listen(port, '127.0.0.1', () => {
+    console.log(`DeepSeek 界面预览：http://127.0.0.1:${port}`);
+    console.log(`空数据预览：http://127.0.0.1:${port}/?empty=1`);
+    console.log('仅使用演示数据与单价，不调用 DeepSeek，不消耗 Token。按 Ctrl+C 退出。');
+  });
+}
+main().catch(error => { console.error(error.message); process.exitCode = 1; });

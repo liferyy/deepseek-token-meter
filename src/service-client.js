@@ -11,8 +11,8 @@ const { summarize } = require('./stats');
 class ServiceClient {
   constructor(directory, extensionPath, port) {
     this.directory = directory; this.extensionPath = extensionPath; this.port = port; this.token = ''; this.starting = null;
-    // While the proxy is stopped the dashboard still polls every few seconds; keep one read-only
-    // store instead of re-reading the JSONL history on every poll.
+    // While the proxy is stopped the dashboard still polls every few seconds; keep one database
+    // connection instead of reopening the SQLite file on every poll.
     this.localStore = null; this.wasRunning = false;
     this.fingerprint = createHash('sha256').update(path.resolve(directory).toLowerCase()).digest('hex').slice(0, 20);
   }
@@ -66,19 +66,23 @@ class ServiceClient {
         if (await this.health()) return;
       }
       // Surface corrupt data/config errors rather than replacing existing files.
-      await new Store(this.directory, this.port).init();
+      const probe = await new Store(this.directory, this.port).init();
+      probe.close();
       throw new Error('代理未能启动，请检查端口或数据目录权限');
     })();
     try { await this.starting; } finally { this.starting = null; }
   }
   async state(query) {
     const search = new URLSearchParams(Object.entries(query || {}).filter(([, v]) => v != null && v !== ''));
-    if (await this.health()) { this.wasRunning = true; return this.request('/_meter/state?' + search); }
-    // The proxy may have written records and then stopped or crashed; reload once on that transition.
-    if (this.wasRunning || !this.localStore) { this.localStore = null; this.wasRunning = false; }
-    const store = await (this.localStore ||= new Store(this.directory, this.port).init());
-    return { ...summarize(store.events, store.config, query), config: store.config,
+    if (await this.health()) { this.wasRunning = true; this.closeLocalStore(); return this.request('/_meter/state?' + search); }
+    // The proxy may have written records and then stopped or crashed; reopen once on that transition.
+    if (this.wasRunning || !this.localStore) { this.closeLocalStore(); this.wasRunning = false; }
+    if (!this.localStore) this.localStore = await new Store(this.directory, this.port).init();
+    const store = this.localStore;
+    return { ...summarize(store.db, store.config, query), config: store.config,
       service: { running: false, active: 0, port: this.port, dataDirectory: this.directory }, warnings: store.warnings };
   }
+  closeLocalStore() { if (this.localStore) { this.localStore.close(); this.localStore = null; } }
+  close() { this.closeLocalStore(); }
 }
 module.exports = { ServiceClient };

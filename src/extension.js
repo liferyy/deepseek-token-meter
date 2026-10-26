@@ -96,5 +96,5 @@ async function exportCsv() {
   await fs.writeFile(uri.fsPath, await client.request('/_meter/export', 'GET', undefined, true), 'utf8');
   vscode.window.showInformationMessage('每日模型用量已导出 CSV（人民币估算按当前单价）');
 }
-function deactivate() { clearInterval(refreshTimer); }
+function deactivate() { clearInterval(refreshTimer); client?.close(); }
 module.exports = { activate, deactivate, sanitizeQuery };

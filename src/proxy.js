@@ -68,7 +68,7 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
       if (!authorized(req.headers['x-meter-token'], token)) return json(res, 401, { error: { message: '本机管理认证失败' } });
       try {
         if (req.method === 'GET' && url.pathname === '/_meter/state') {
-          return json(res, 200, { ...summarize(store.events, store.config, Object.fromEntries(url.searchParams)), config: store.config,
+          return json(res, 200, { ...summarize(store.db, store.config, Object.fromEntries(url.searchParams)), config: store.config,
             service: { running: true, port, active, revision: store.revision, dataDirectory: store.directory }, warnings: store.warnings });
         }
         if (req.method === 'POST' && url.pathname === '/_meter/config') {
@@ -77,9 +77,9 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
           return json(res, 200, await store.saveConfig(value));
         }
         if (req.method === 'GET' && url.pathname === '/_meter/export') {
-          res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store' }); res.end(dailyCsv(store.events, store.config)); return;
+          res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store' }); res.end(dailyCsv(store.db, store.config)); return;
         }
-        if (req.method === 'GET' && url.pathname === '/_meter/backup') return json(res, 200, { format: PRODUCT, version: 1, config: store.config, events: store.events });
+        if (req.method === 'GET' && url.pathname === '/_meter/backup') return json(res, 200, { format: PRODUCT, version: 1, config: store.config, events: store.allEvents() });
         if (req.method === 'POST' && url.pathname === '/_meter/import') {
           const backup = JSON.parse((await bodyOf(req, 64 * 1024 * 1024)).toString('utf8'));
           if (backup.format !== PRODUCT || backup.version !== 1) throw new Error('请选择本插件导出的 JSON 备份文件');

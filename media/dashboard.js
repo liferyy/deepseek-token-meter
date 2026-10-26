@@ -43,7 +43,7 @@
     $('base-url').textContent = 'http://127.0.0.1:' + service.port + '/v1';
     $('full-url').textContent = 'http://127.0.0.1:' + service.port + '/v1/chat/completions';
     $('data-directory').textContent = service.dataDirectory;
-    $('range-caption').textContent = '按请求开始时间统计 · ' + value.timezone + (query.model ? ' · ' + query.model : '');
+    $('range-caption').textContent = '按请求开始时间统计 · ' + value.timezone + ' · 峰谷按北京时间' + (query.model ? ' · ' + query.model : '');
     $('requests').textContent = number(t.requests);
     $('request-detail').textContent = '成功 ' + number(t.success) + ' / 异常 ' + number(t.errors) + (t.cancelled ? ' / 取消 ' + number(t.cancelled) : '');
     $('tokens').textContent = short(t.total);
@@ -51,7 +51,9 @@
     $('token-detail').textContent = '输入 ' + short(t.prompt) + ' / 输出 ' + short(t.output);
     const measured = t.requests - t.missingUsage;
     $('cost').textContent = measured && t.unpriced === measured ? '未定价' : !measured && t.requests ? '—' : money(t.cost);
-    $('cost-detail').textContent = t.unpriced ? '已定价部分 ' + money(t.cost) + ' · ' + t.unpriced + ' 次未定价' : '缓存读写 ' + money(t.cacheCost) + ' · 按当前单价';
+    $('cost-detail').textContent = measured && t.unpriced === measured ? '全部请求未定价'
+      : '高峰 ' + money(t.costPeak) + ' · 空闲 ' + money(t.costOffPeak) + (t.unpriced ? ' · ' + t.unpriced + ' 次未定价' : '');
+    $('cost-detail').title = '缓存读写 ' + money(t.cacheCost) + ' · 高峰时段按高峰单价，空闲时段按 50%';
     const messages = [];
     if (!service.running) messages.push('代理已停止，启动后继续采集；历史统计仍可查看。');
     if (service.active) messages.push(service.active + ' 个请求正在进行，结束后计入统计。');
@@ -153,13 +155,17 @@
       title.append(node('i', null, 'model-dot'), button); if (model.unpriced) title.append(node('span', '未定价', 'mini-badge')); cell.append(title); row.append(cell);
       for (const key of ['requests', 'input', 'cacheRead', 'cacheWrite', 'output', 'total']) { const c = node('td', key === 'requests' ? number(model[key]) : short(model[key])); c.title = number(model[key]); row.append(c); }
       const cost = node('td', model.unpriced === model.requests - model.missingUsage && model.unpriced > 0 ? '未定价' : money(model.cost) + (model.unpriced ? ' + 待定价' : ''));
-      if (model.missingUsage === model.requests) cost.textContent = '—'; row.append(cost); $('model-rows').append(row);
+      if (model.missingUsage === model.requests) cost.textContent = '—';
+      cost.title = '高峰 ' + money(model.costPeak) + ' · 空闲 ' + money(model.costOffPeak);
+      row.append(cost); $('model-rows').append(row);
     }
   }
   function renderRecent() {
     $('recent-rows').replaceChildren();
     for (const event of state.recent) {
-      const tr = node('tr'); tr.append(node('td', formatTime(event.startedAt, true)), node('td', event.model));
+      const tr = node('tr');
+      tr.append(node('td', formatTime(event.startedAt, true)),
+        node('td', event.peak ? '高峰' : '空闲', event.peak ? 'peak-label' : 'offpeak-label'), node('td', event.model));
       const status = node('td', event.status === 'success' ? '成功' : event.status === 'cancelled' ? '已取消' : '异常');
       status.className = event.status === 'success' ? 'success-label' : 'error-label'; status.title = event.errorCode || ('HTTP ' + event.httpStatus); tr.append(status);
       const tokens = node('td', event.usage ? short(event.usage.total) + (event.partial ? '（部分）' : '') : '用量未知'); if (!event.usage) tokens.className = 'unknown-label'; tr.append(tokens, node('td', (event.durationMs / 1000).toFixed(1) + 's')); $('recent-rows').append(tr);
@@ -167,11 +173,11 @@
   }
   function renderPrices() {
     const tbody = $('price-rows'); tbody.replaceChildren();
-    if (!prices.length) { const tr = node('tr'), td = node('td', '尚未配置模型价格。添加模型后，填写平台当前的人民币单价。'); td.colSpan = 6; td.style.padding = '30px 12px'; tr.append(td); tbody.append(tr); }
+    if (!prices.length) { const tr = node('tr'), td = node('td', '尚未配置模型价格。添加模型后，填写平台当前的高峰时段人民币单价。'); td.colSpan = 6; td.style.padding = '30px 12px'; tr.append(td); tbody.append(tr); }
     prices.forEach((price, index) => {
       const tr = node('tr');
       for (const key of ['model', ...priceKeys]) {
-        const td = node('td'), input = node('input'); input.type = key === 'model' ? 'text' : 'number'; input.value = price[key]; input.setAttribute('aria-label', price.model + ' ' + (key === 'model' ? '模型 ID' : labels[key] + '价格'));
+        const td = node('td'), input = node('input'); input.type = key === 'model' ? 'text' : 'number'; input.value = price[key]; input.setAttribute('aria-label', price.model + ' ' + (key === 'model' ? '模型 ID' : labels[key] + '高峰价格'));
         if (key !== 'model') { input.min = '0'; input.step = 'any'; input.inputMode = 'decimal'; input.required = true; } else input.maxLength = 200;
         input.addEventListener('input', () => { price[key] = key === 'model' ? input.value : input.value === '' ? null : Number(input.value); pricesDirty = true; }); td.append(input); tr.append(td);
       }
@@ -188,7 +194,7 @@
     if (!state) return;
     const config = structuredClone(state.config);
     if (kind === 'prices') {
-      if (prices.some(row => !row.model.trim() || priceKeys.some(key => typeof row[key] !== 'number' || !Number.isFinite(row[key]) || row[key] < 0))) return notice('请填写完整的模型 ID 和非负单价', true);
+      if (prices.some(row => !row.model.trim() || priceKeys.some(key => typeof row[key] !== 'number' || !Number.isFinite(row[key]) || row[key] < 0))) return notice('请填写完整的模型 ID 和非负高峰单价', true);
       config.prices = structuredClone(prices);
     } else { config.upstream = $('upstream').value.trim(); config.timezone = $('timezone').value.trim(); config.includeUsage = $('include-usage').checked; }
     pendingSave = kind; $('save-prices').disabled = $('save-settings').disabled = true; post('saveConfig', { value: config });

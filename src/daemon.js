@@ -18,6 +18,7 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     await meter.close();
+    store.close();
     process.exit(0);
   };
   const fingerprint = createHash('sha256').update(path.resolve(directory).toLowerCase()).digest('hex').slice(0, 20);
