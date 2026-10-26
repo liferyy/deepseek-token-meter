@@ -7,12 +7,19 @@ const readline = require('node:readline');
 const { randomBytes } = require('node:crypto');
 const { DEFAULT_CONFIG, validateConfig } = require('./config');
 const { openDatabase, insertEvent, transaction, INSERT_SQL } = require('./db');
+const { load: loadHolidays } = require('./holidays');
 const { rowToEvent } = require('./stats');
+
+const RETENTION_MS = 365 * 86400000;
 
 async function atomicJson(file, object) {
   const temp = file + '.' + randomBytes(5).toString('hex') + '.tmp';
   await fsp.writeFile(temp, JSON.stringify(object, null, 2), { mode: 0o600 });
   try { await fsp.rename(temp, file); } catch (error) { await fsp.unlink(temp).catch(() => {}); throw error; }
+}
+
+function cleanText(value, limit) {
+  return typeof value === 'string' ? value.replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, limit) : '';
 }
 
 function cleanEvent(value) {
@@ -39,13 +46,15 @@ function cleanEvent(value) {
     durationMs: Number.isFinite(value.durationMs) ? Math.max(0, Math.round(value.durationMs)) : 0,
     endpoint: ['chat', 'responses', 'messages', 'completion'].includes(value.endpoint) ? value.endpoint : 'chat',
     source: value.source === 'import' ? 'import' : 'proxy', partial: value.partial === true,
-    errorCode: typeof value.errorCode === 'string' ? value.errorCode.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60) : '', usage };
+    errorCode: typeof value.errorCode === 'string' ? value.errorCode.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60) : '',
+    title: cleanText(value.title, 120), summary: cleanText(value.summary, 200), usage };
 }
 
 class Store {
-  constructor(directory, port) {
+  constructor(directory, port, { now = Date.now } = {}) {
     this.directory = directory;
     this.port = port;
+    this.now = now;
     this.memory = directory === ':memory:';
     this.config = structuredClone(DEFAULT_CONFIG);
     this.warnings = [];
@@ -60,6 +69,7 @@ class Store {
       return this;
     }
     await fsp.mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await loadHolidays(this.directory);
     try { this.config = validateConfig(JSON.parse(await fsp.readFile(path.join(this.directory, 'config.json'), 'utf8')), this.port); }
     catch (error) {
       if (error.code !== 'ENOENT') throw new Error('本地配置读取失败，请检查 config.json：' + error.message);
@@ -68,7 +78,14 @@ class Store {
     this.db = openDatabase(path.join(this.directory, 'usage.db'));
     this.insert = this.db.prepare(INSERT_SQL);
     await this.importLegacyJsonl();
+    this.pruneStale();
     return this;
+  }
+  // Only the last 365 days are kept; older rows are removed when the plugin (or proxy) starts.
+  pruneStale(now = this.now()) {
+    const removed = Number(this.db.prepare('DELETE FROM events WHERE started_at < ?').run(now - RETENTION_MS).changes);
+    if (removed) this.revision++;
+    return removed;
   }
   // One-time upgrade from the old monthly JSONL files. The files are deleted only after the transaction commits,
   // and INSERT OR IGNORE makes a retry after a crash safe.

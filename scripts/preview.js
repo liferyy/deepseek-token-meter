@@ -23,10 +23,13 @@ let seed = 20261026;
 function rand() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
 function demoEvents() {
   const now = Date.now(), today = dateKey(now, 'Asia/Shanghai'), result = [];
+  const titles = ['生成接口文档', '重构筛选逻辑', '解释缓存命中', '排查构建报错', '编写单元测试'];
   const add = (at, index) => {
     const prompt = 2000 + Math.floor(rand() * 42000), cacheRead = Math.floor(prompt * (.4 + rand() * .5)), output = 300 + Math.floor(rand() * 2200);
     const model = rand() > .25 ? 'deepseek-chat' : 'deepseek-reasoner';
+    const summary = [4 + Math.floor(rand() * 16) + ' 条消息', rand() > .5 ? 1 + Math.floor(rand() * 5) + ' 个工具' : '', rand() > .35 ? '流式输出' : ''].filter(Boolean).join(' · ');
     result.push({ id: 'demo_' + index, startedAt: new Date(at).toISOString(), requestedModel: model, model, status: 'success', httpStatus: 200, endpoint: 'chat', durationMs: Math.floor(800 + rand() * 9000), partial: false,
+      title: index % 4 ? titles[index % titles.length] : '', summary,
       usage: { input: prompt - cacheRead, cacheRead, cacheWrite: 0, output, reasoning: model === 'deepseek-reasoner' ? Math.floor(output * .6) : 0, prompt, total: prompt + output } });
   };
   for (let day = 364; day >= 0; day--) {

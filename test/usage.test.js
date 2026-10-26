@@ -4,6 +4,15 @@ const assert = require('node:assert/strict');
 const { normalizeUsage, UsageCollector } = require('../src/usage');
 const { costFor, rateFor, validateConfig, DEFAULT_CONFIG } = require('../src/config');
 const { isPeak } = require('../src/peak');
+const { apply } = require('../src/holidays');
+
+// Holiday dates normally come from the cached holiday-cn file; tests seed them directly.
+apply({ source: 'test', updatedAt: '2026-01-01T00:00:00Z', days: [
+  { date: '2026-10-01', isOffDay: true },
+  { date: '2026-06-19', isOffDay: true },
+  { date: '2026-02-16', isOffDay: true },
+  { date: '2026-10-10', isOffDay: false }
+]});
 
 test('DeepSeek cache hits and reasoning are not double counted', () => {
   const usage = normalizeUsage({ prompt_tokens: 1000, prompt_cache_hit_tokens: 900, prompt_cache_miss_tokens: 100, completion_tokens: 200, completion_tokens_details: { reasoning_tokens: 150 }, total_tokens: 1200 });
@@ -26,6 +35,8 @@ test('peak windows follow Beijing weekday hours and Chinese holidays', () => {
   assert.equal(isPeak(at('2026-06-19T02:00:00Z')), false); // 端午节（周五）
   assert.equal(isPeak(at('2026-02-16T02:00:00Z')), false); // 春节（周一）
   assert.equal(isPeak(at('2025-10-09T02:00:00Z')), true); // 假期结束后的周四
+  assert.equal(isPeak(at('2026-10-10T02:00:00Z')), true); // 周六调休上班
+  assert.equal(isPeak(at('2026-10-11T02:00:00Z')), false); // 周日
 });
 test('cached details fallback and unknown usage', () => {
   assert.equal(normalizeUsage({ prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 80 }, completion_tokens: 4 }).input, 20);

@@ -7,7 +7,7 @@
   const labels = { input: '输入（非缓存）', cacheRead: '缓存读取', cacheWrite: '缓存写入', output: '模型输出' };
   const priceKeys = ['input', 'output', 'cacheRead', 'cacheWrite'];
   const saved = bridge?.getState?.() || {};
-  let query = { range: 'today', model: '', ...saved.query }, state, prices = [], pricesDirty = false, settingsDirty = false, editingConfig;
+  let query = { range: 'today', model: '', page: 1, size: 20, ...saved.query }, state, prices = [], pricesDirty = false, settingsDirty = false, editingConfig;
   let toastTimer, resizeTimer, pendingSave;
   const short = n => n >= 1e9 ? (n / 1e9).toFixed(2) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n || 0);
   const number = n => Number(n || 0).toLocaleString('zh-CN');
@@ -33,6 +33,9 @@
   }
   function formatTime(value, date = false) {
     return new Intl.DateTimeFormat('zh-CN', { timeZone: state?.timezone || 'Asia/Shanghai', ...(date ? { month: '2-digit', day: '2-digit' } : {}), hour: '2-digit', minute: '2-digit', second: date ? undefined : '2-digit', hourCycle: 'h23' }).format(new Date(value));
+  }
+  function formatDate(value) {
+    return new Intl.DateTimeFormat('zh-CN', { timeZone: state?.timezone || 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(value));
   }
   function render(value) {
     state = value;
@@ -63,6 +66,15 @@
     messages.push(...(value.warnings || []));
     $('data-notice').hidden = !messages.length; $('data-notice').textContent = messages.join(' ');
     $('updated-at').textContent = '更新于 ' + formatTime(value.generatedAt) + ' · ' + value.timezone;
+    const bucketStats = value.bucketStats || { count: 0, average: 0, median: 0 };
+    $('chart-summary').textContent = bucketStats.count
+      ? '单位：Tokens · 有请求时段平均 ' + short(Math.round(bucketStats.average)) + ' / 中位数 ' + short(Math.round(bucketStats.median)) + '（' + bucketStats.count + ' 个时段）'
+      : '单位：Tokens · 当前区间没有请求';
+    const holiday = value.holidays;
+    $('holiday-status').textContent = holiday && holiday.updatedAt
+      ? '法定节假日数据：' + formatDate(holiday.updatedAt) + ' 更新 · 覆盖 ' + (holiday.years.length ? holiday.years.join('、') : '—') + ' 年 · 来源 holiday-cn，启动插件时自动刷新'
+      : '法定节假日数据尚未获取，暂时只按周末与工作时间判断峰谷；联网启动插件后会自动写入本地缓存。';
+    $('page-size').value = String(query.size);
     const selected = $('model-filter').value || query.model;
     $('model-filter').replaceChildren(node('option', '全部模型'));
     $('model-filter').firstChild.value = '';
@@ -112,11 +124,23 @@
       chart.append(g);
       if (i % labelEvery === 0 || (i === buckets.length - 1 && i % labelEvery > labelEvery / 2)) chart.append(svg('text', { x, y: height - 8, fill: '#858f96', 'font-size': 10, 'text-anchor': 'middle' }, bucket.label));
     });
-    const average = state.totals.total / Math.max(1, buckets.length);
+    const stats = state.bucketStats || { average: 0, median: 0 };
+    const average = stats.average || 0, median = stats.median || 0;
+    const lineLabel = (text, x, y, color, anchor) => {
+      const width = text.replace(/[^\x00-\xff]/g, '00').length * 5.6 + 10;
+      const boxX = anchor === 'end' ? x - width : x - 3;
+      chart.append(svg('rect', { x: boxX, y: y - 10, width, height: 14, rx: 3, fill: '#111314', opacity: .82 }));
+      chart.append(svg('text', { x, y, fill: color, 'font-size': 10, 'text-anchor': anchor }, text));
+    };
     if (average > 0) {
       const y = top + h - average / max * h;
       chart.append(svg('line', { x1: left, x2: width - right, y1: y, y2: y, stroke: colors.output, 'stroke-width': 1.4, 'stroke-dasharray': '6 5', opacity: .85 }));
-      chart.append(svg('text', { x: left + 4, y: y - 7, fill: '#c9a839', 'font-size': 10 }, '平均 ' + short(Math.round(average))));
+      lineLabel('平均 ' + short(Math.round(average)), left + 4, y - 7, '#c9a839', 'start');
+    }
+    if (median > 0) {
+      const y = top + h - median / max * h;
+      chart.append(svg('line', { x1: left, x2: width - right, y1: y, y2: y, stroke: '#8f7bff', 'stroke-width': 1.4, 'stroke-dasharray': '2 4', opacity: .9 }));
+      lineLabel('中位数 ' + short(Math.round(median)), width - right - 2, y + 13, '#a99cff', 'end');
     }
   }
   function showTooltip(bucket, x, width) {
@@ -140,7 +164,7 @@
       c.style.background = color; c.style.setProperty('--cell-color', color);
       const title = day.date + ' · ' + number(day.total) + ' Tokens · ' + day.requests + ' 次调用';
       c.title = title; c.setAttribute('aria-label', title);
-      c.addEventListener('click', () => { query.range = 'custom'; query.from = query.to = day.date; $('date-from').value = $('date-to').value = day.date; updateRangeButtons(); refresh(); });
+      c.addEventListener('click', () => { query.range = 'custom'; query.from = query.to = day.date; query.page = 1; $('date-from').value = $('date-to').value = day.date; updateRangeButtons(); refresh(); });
       grid.append(c); if (day.requests) active++;
     }
     const months = node('div', null, 'heat-months');
@@ -161,15 +185,31 @@
     }
   }
   function renderRecent() {
+    const recent = state.recent || { items: [], total: 0, page: 1, size: 20, pages: 1 };
+    query.page = recent.page;
     $('recent-rows').replaceChildren();
-    for (const event of state.recent) {
+    if (!recent.items.length) {
+      const tr = node('tr'), td = node('td', '当前筛选条件下没有请求记录。', 'recent-empty');
+      td.colSpan = 7; tr.append(td); $('recent-rows').append(tr);
+    }
+    for (const event of recent.items) {
       const tr = node('tr');
       tr.append(node('td', formatTime(event.startedAt, true)),
         node('td', event.peak ? '高峰' : '空闲', event.peak ? 'peak-label' : 'offpeak-label'), node('td', event.model));
+      const info = node('td', null, 'recent-info');
+      if (event.title) info.append(node('span', event.title, 'request-title'));
+      if (event.summary) info.append(node('span', event.summary, 'request-summary'));
+      if (!event.title && !event.summary) info.append(node('span', '未记录概要', 'unknown-label'));
+      info.title = [event.title, event.summary].filter(Boolean).join(' · ');
+      tr.append(info);
       const status = node('td', event.status === 'success' ? '成功' : event.status === 'cancelled' ? '已取消' : '异常');
       status.className = event.status === 'success' ? 'success-label' : 'error-label'; status.title = event.errorCode || ('HTTP ' + event.httpStatus); tr.append(status);
       const tokens = node('td', event.usage ? short(event.usage.total) + (event.partial ? '（部分）' : '') : '用量未知'); if (!event.usage) tokens.className = 'unknown-label'; tr.append(tokens, node('td', (event.durationMs / 1000).toFixed(1) + 's')); $('recent-rows').append(tr);
     }
+    $('recent-total').textContent = '共 ' + number(recent.total) + ' 条 · 每页 ' + recent.size + ' 条';
+    $('page-label').textContent = recent.page + ' / ' + recent.pages;
+    $('page-prev').disabled = recent.page <= 1;
+    $('page-next').disabled = recent.page >= recent.pages;
   }
   function renderPrices() {
     const tbody = $('price-rows'); tbody.replaceChildren();
@@ -213,14 +253,17 @@
   });
   for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => tab(button.dataset.tab));
   for (const button of document.querySelectorAll('[data-range]')) button.addEventListener('click', () => {
-    query.range = button.dataset.range; updateRangeButtons();
+    query.range = button.dataset.range; query.page = 1; updateRangeButtons();
     if (query.range === 'custom') {
       if (!query.from) { query.from = state?.heatmap.at(-1)?.date || new Date().toISOString().slice(0, 10); query.to = query.from; }
       $('date-from').value = query.from; $('date-to').value = query.to;
     } else refresh();
   });
-  $('apply-dates').addEventListener('click', () => { if (!$('date-from').value || !$('date-to').value) return notice('请选择开始和结束日期', true); query.from = $('date-from').value; query.to = $('date-to').value; refresh(); });
-  $('model-filter').addEventListener('change', () => { query.model = $('model-filter').value; refresh(); });
+  $('apply-dates').addEventListener('click', () => { if (!$('date-from').value || !$('date-to').value) return notice('请选择开始和结束日期', true); query.from = $('date-from').value; query.to = $('date-to').value; query.page = 1; refresh(); });
+  $('model-filter').addEventListener('change', () => { query.model = $('model-filter').value; query.page = 1; refresh(); });
+  $('page-prev').addEventListener('click', () => { if (state?.recent?.page > 1) { query.page = state.recent.page - 1; refresh(); } });
+  $('page-next').addEventListener('click', () => { if (state?.recent && state.recent.page < state.recent.pages) { query.page = state.recent.page + 1; refresh(); } });
+  $('page-size').addEventListener('change', () => { query.size = Number($('page-size').value); query.page = 1; refresh(); });
   $('refresh').addEventListener('click', refresh);
   $('save-prices').addEventListener('click', () => saveConfig('prices')); $('save-settings').addEventListener('click', () => saveConfig('settings'));
   $('add-price').addEventListener('click', addPrice); $('new-model').addEventListener('keydown', e => { if (e.key === 'Enter') addPrice(); });
@@ -231,5 +274,8 @@
   $('open-data').addEventListener('click', () => post('openData')); $('empty-connect').addEventListener('click', () => tab('settings'));
   window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawChart, 100); });
   updateRangeButtons(); tab(saved.tab || 'overview'); if (query.from) $('date-from').value = query.from; if (query.to) $('date-to').value = query.to;
+  if (![10, 20, 50, 100].includes(Number(query.size))) query.size = 20;
+  if (!Number.isFinite(Number(query.page)) || Number(query.page) < 1) query.page = 1;
+  $('page-size').value = String(query.size);
   post('ready', { query });
 })();

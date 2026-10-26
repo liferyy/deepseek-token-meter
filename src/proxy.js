@@ -6,6 +6,8 @@ const zlib = require('node:zlib');
 const { randomUUID, timingSafeEqual } = require('node:crypto');
 const { UsageCollector } = require('./usage');
 const { summarize, dailyCsv } = require('./stats');
+const { load: loadHolidays } = require('./holidays');
+const { version: VERSION } = require('../package.json');
 
 const PRODUCT = 'deepseek-token-meter';
 const HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length']);
@@ -43,6 +45,25 @@ function upstreamTarget(base, endpoint, query) {
   url.search = query;
   return url;
 }
+function cleanText(value, limit) {
+  return typeof value === 'string' ? value.replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, limit) : '';
+}
+// Only an explicit title plus structural facts are kept; message content is never recorded.
+const TITLE_KEYS = ['title', 'name', 'conversation_title', 'session_title'];
+function describeRequest(object) {
+  const meta = object.metadata && typeof object.metadata === 'object' ? object.metadata : {};
+  const candidate = [...TITLE_KEYS.map(key => object[key]), ...TITLE_KEYS.map(key => meta[key])]
+    .find(value => typeof value === 'string' && value.trim());
+  const messages = Array.isArray(object.messages) ? object.messages.length : Array.isArray(object.input) ? object.input.length : 0;
+  const tools = Array.isArray(object.tools) ? object.tools.length : 0;
+  const limit = object.max_tokens ?? object.max_completion_tokens;
+  const parts = [];
+  if (messages) parts.push(messages + ' 条消息');
+  if (tools) parts.push(tools + ' 个工具');
+  if (object.stream === true) parts.push('流式输出');
+  if (Number.isInteger(limit) && limit > 0) parts.push('上限 ' + limit + ' Tokens');
+  return { title: cleanText(candidate, 120), summary: parts.join(' · ') };
+}
 function drained(stream) {
   if (stream.destroyed) return Promise.resolve();
   return new Promise((resolve, reject) => {
@@ -64,11 +85,13 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
     let url;
     try { url = new URL(req.url, 'http://127.0.0.1'); } catch { return json(res, 400, { error: { message: '请求地址无效' } }); }
     if (url.pathname.startsWith('/_meter/')) {
-      if (url.pathname === '/_meter/health' && req.method === 'GET') return json(res, 200, { product: PRODUCT, version: '1.0.0', fingerprint, port });
+      if (url.pathname === '/_meter/health' && req.method === 'GET') return json(res, 200, { product: PRODUCT, version: VERSION, fingerprint, port });
       if (!authorized(req.headers['x-meter-token'], token)) return json(res, 401, { error: { message: '本机管理认证失败' } });
       try {
         if (req.method === 'GET' && url.pathname === '/_meter/state') {
-          return json(res, 200, { ...summarize(store.db, store.config, Object.fromEntries(url.searchParams)), config: store.config,
+          // Pick up holiday data refreshed by a newer editor window before recalculating peak/off-peak.
+          const holidays = await loadHolidays(store.directory);
+          return json(res, 200, { ...summarize(store.db, store.config, Object.fromEntries(url.searchParams)), holidays, config: store.config,
             service: { running: true, port, active, revision: store.revision, dataDirectory: store.directory }, warnings: store.warnings });
         }
         if (req.method === 'POST' && url.pathname === '/_meter/config') {
@@ -101,7 +124,7 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
     active++;
     const started = Date.now(), endpoint = match[1];
     let collector, model = 'unknown', statusCode = 0, saved = false, upstreamReq, upstreamRes, upstreamEnded = false;
-    let cancelled = false, timedOut = false, validModel = false;
+    let cancelled = false, timedOut = false, validModel = false, info = { title: '', summary: '' };
     const config = store.config;
     const record = async (status, errorCode = '') => {
       if (saved || endpoint === 'models' || !validModel) return;
@@ -111,7 +134,7 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
         await store.add({ id: randomUUID(), startedAt: new Date(started).toISOString(), requestedModel: model,
           model: collector?.model || model, status, httpStatus: statusCode, durationMs: Date.now() - started,
           endpoint: endpoint === 'chat/completions' ? 'chat' : endpoint === 'completions' ? 'completion' : endpoint,
-          usage, partial: Boolean(usage && status !== 'success'), errorCode });
+          title: info.title, summary: info.summary, usage, partial: Boolean(usage && status !== 'success'), errorCode });
       } catch { onError('用量记录写入失败，请检查数据目录和磁盘空间'); }
     };
     const close = () => {
@@ -128,6 +151,7 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
         if (typeof object.model !== 'string' || !object.model.trim() || object.model.length > 200) return json(res, 400, { error: { message: '请求缺少有效的模型 ID' } });
         model = object.model;
         validModel = true;
+        info = describeRequest(object);
         if (config.includeUsage && object.stream === true && endpoint === 'chat/completions') { object.stream_options = { ...(object.stream_options || {}), include_usage: true }; body = Buffer.from(JSON.stringify(object)); }
       }
       const target = upstreamTarget(config.upstream, endpoint, url.search);
@@ -186,4 +210,4 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
     async close() { for (const agent of Object.values(agents)) agent.destroy(); for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); await store.flush(); } };
 }
 
-module.exports = { createMeterServer, upstreamTarget, headersFor, PRODUCT };
+module.exports = { createMeterServer, upstreamTarget, headersFor, describeRequest, PRODUCT };

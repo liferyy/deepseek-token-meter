@@ -7,6 +7,7 @@ const { spawn } = require('node:child_process');
 const { randomBytes, createHash } = require('node:crypto');
 const { Store } = require('./store');
 const { summarize } = require('./stats');
+const { load: loadHolidays } = require('./holidays');
 
 class ServiceClient {
   constructor(directory, extensionPath, port) {
@@ -79,7 +80,9 @@ class ServiceClient {
     if (this.wasRunning || !this.localStore) { this.closeLocalStore(); this.wasRunning = false; }
     if (!this.localStore) this.localStore = await new Store(this.directory, this.port).init();
     const store = this.localStore;
-    return { ...summarize(store.db, store.config, query), config: store.config,
+    // A background refresh may have rewritten the holiday cache since this store was opened.
+    const holidays = await loadHolidays(this.directory);
+    return { ...summarize(store.db, store.config, query), holidays, config: store.config,
       service: { running: false, active: 0, port: this.port, dataDirectory: this.directory }, warnings: store.warnings };
   }
   closeLocalStore() { if (this.localStore) { this.localStore.close(); this.localStore = null; } }

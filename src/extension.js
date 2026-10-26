@@ -5,6 +5,8 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomBytes } = require('node:crypto');
 const { ServiceClient } = require('./service-client');
+const { refresh: refreshHolidays } = require('./holidays');
+const { RECENT_SIZES, DEFAULT_RECENT_SIZE } = require('./stats');
 
 let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, refreshPromise;
 function compact(n) { return n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n); }
@@ -12,6 +14,8 @@ function compact(n) { return n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? 
 async function activate(context) {
   const settings = vscode.workspace.getConfiguration('deepseekTokenMeter');
   client = await new ServiceClient(context.globalStorageUri.fsPath, context.extensionPath, settings.get('port', 18765)).init();
+  // Refresh the statutory holiday data once per start; failures keep the cached file.
+  refreshHolidays(client.directory).catch(() => {});
   const tree = { getTreeItem: item => item, getChildren: () => [], onDidChangeTreeData: new vscode.EventEmitter().event };
   context.subscriptions.push(vscode.window.registerTreeDataProvider('deepseekTokenMeter.welcome', tree));
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
@@ -87,7 +91,9 @@ async function openPanel(context) {
 }
 function sanitizeQuery(query) {
   const range = ['today', '1h', '10m', 'week', 'month', 'custom'].includes(query.range) ? query.range : 'today';
-  return { range, model: typeof query.model === 'string' ? query.model.slice(0, 200) : '', from: typeof query.from === 'string' ? query.from.slice(0, 10) : '', to: typeof query.to === 'string' ? query.to.slice(0, 10) : '' };
+  const page = Math.min(1000000, Math.max(1, Number.parseInt(query.page, 10) || 1));
+  const size = RECENT_SIZES.includes(Number(query.size)) ? Number(query.size) : DEFAULT_RECENT_SIZE;
+  return { range, model: typeof query.model === 'string' ? query.model.slice(0, 200) : '', from: typeof query.from === 'string' ? query.from.slice(0, 10) : '', to: typeof query.to === 'string' ? query.to.slice(0, 10) : '', page, size };
 }
 async function exportCsv() {
   await client.ensure();

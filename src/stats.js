@@ -76,9 +76,42 @@ function rowToEvent(row) {
   const prompt = row.input + row.cache_read + row.cache_write;
   return { id: row.id, startedAt: new Date(row.started_at).toISOString(), model: row.model, requestedModel: row.requested_model,
     status: row.status, httpStatus: row.http_status, durationMs: row.duration_ms, endpoint: row.endpoint, source: row.source,
-    partial: row.partial === 1, errorCode: row.error_code,
+    partial: row.partial === 1, errorCode: row.error_code, title: row.title, summary: row.summary,
     usage: row.has_usage ? { input: row.input, cacheRead: row.cache_read, cacheWrite: row.cache_write, output: row.output,
       reasoning: row.reasoning, prompt, total: prompt + row.output } : null };
+}
+
+const RECENT_SIZES = [10, 20, 50, 100];
+const DEFAULT_RECENT_SIZE = 20;
+function pageNumber(value, fallback, min, max) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+}
+
+// Average and median ignore empty buckets: a day with three active hours should not be
+// described by eighteen zero hours.
+function bucketStatistics(buckets) {
+  const values = buckets.filter(bucket => bucket.requests > 0).map(bucket => bucket.total).sort((a, b) => a - b);
+  if (!values.length) return { count: 0, average: 0, median: 0 };
+  const middle = values.length >> 1;
+  return {
+    count: values.length,
+    average: values.reduce((sum, value) => sum + value, 0) / values.length,
+    median: values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2
+  };
+}
+
+function recentPage(db, range, model, query) {
+  const size = pageNumber(query.size, DEFAULT_RECENT_SIZE, 5, 200);
+  const clause = 'started_at >= ? AND started_at < ?' + (model ? ' AND model = ?' : '');
+  const params = model ? [range.from, range.to, model] : [range.from, range.to];
+  const total = Number(db.prepare('SELECT COUNT(*) AS n FROM events WHERE ' + clause).get(...params).n);
+  const pages = Math.max(1, Math.ceil(total / size));
+  const page = Math.min(pageNumber(query.page, 1, 1, 1000000), pages);
+  const items = db.prepare('SELECT * FROM events WHERE ' + clause + ' ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?')
+    .all(...params, size, (page - 1) * size)
+    .map(row => ({ ...rowToEvent(row), peak: isPeak(row.started_at) }));
+  return { items, total, page, size, pages };
 }
 
 function summarize(db, config, query = {}, now = Date.now()) {
@@ -127,11 +160,10 @@ function summarize(db, config, query = {}, now = Date.now()) {
   const heatmap = [];
   for (let key = shiftDate(today, -364); key <= today; key = shiftDate(key, 1)) heatmap.push(heatMap.get(key) || blank({ date: key }));
 
-  const recent = db.prepare('SELECT * FROM events WHERE started_at >= ? AND started_at < ?' + (query.model ? ' AND model = ?' : '') +
-    ' ORDER BY started_at DESC, id DESC LIMIT 60').all(...(query.model ? [range.from, range.to, query.model] : [range.from, range.to]))
-    .map(row => ({ ...rowToEvent(row), peak: isPeak(row.started_at) }));
+  const recent = recentPage(db, range, query.model, query);
   const allModels = db.prepare('SELECT DISTINCT model FROM events ORDER BY model').all().map(row => row.model);
-  return { range, timezone: zone, totals, buckets, models: [...models.values()].sort((a, b) => b.total - a.total),
+  return { range, timezone: zone, totals, buckets, bucketStats: bucketStatistics(buckets),
+    models: [...models.values()].sort((a, b) => b.total - a.total),
     allModels, heatmap, recent, generatedAt: new Date(now).toISOString() };
 }
 
@@ -149,4 +181,4 @@ function dailyCsv(db, config) {
   return '\ufeff' + headers.map(escape).join(',') + '\r\n' + [...rows.values()].sort((a, b) => a.date.localeCompare(b.date) || a.model.localeCompare(b.model)).map(row => fields.map(k => escape(moneyKeys.includes(k) ? row[k].toFixed(8) : row[k])).join(',')).join('\r\n') + '\r\n';
 }
 
-module.exports = { summarize, dailyCsv, rowToEvent, dateKey, midnight, makeRange, shiftDate, blank };
+module.exports = { summarize, dailyCsv, rowToEvent, dateKey, midnight, makeRange, shiftDate, blank, RECENT_SIZES, DEFAULT_RECENT_SIZE };

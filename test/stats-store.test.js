@@ -10,6 +10,7 @@ const { DEFAULT_CONFIG } = require('../src/config');
 const { normalizeUsage } = require('../src/usage');
 const usage = normalizeUsage({ prompt_tokens: 1000, prompt_cache_hit_tokens: 900, completion_tokens: 200 });
 const config = { ...DEFAULT_CONFIG, prices: [{ model: 'deepseek-chat', input: 2, output: 8, cacheRead: .2, cacheWrite: 0 }] };
+const NOW = Date.parse('2026-10-26T10:00:00Z');
 const event = (id, at, extra = {}) => ({ id, startedAt: at, model: 'deepseek-chat', status: 'success', usage, ...extra });
 
 async function memoryStore(t, values = []) {
@@ -36,7 +37,7 @@ test('peak and off-peak costs are split by request start time', async t => {
   assert.equal(result.totals.costPeak, 2);
   assert.equal(result.totals.costOffPeak, 1);
   assert.equal(result.totals.cost, 3);
-  assert.deepEqual(result.recent.map(e => e.peak), [false, true]);
+  assert.deepEqual(result.recent.items.map(e => e.peak), [false, true]);
 });
 test('missing, partial, cancelled and unpriced requests are transparent', async t => {
   const now = Date.parse('2026-10-26T10:00:00Z');
@@ -65,7 +66,7 @@ test('CSV includes per-day model splits, RMB labels and formula escaping', async
 test('SQLite store survives concurrent writes, dedup, restart and reprice', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-test-'));
   const opened = [];
-  const open = async () => { const store = await new Store(directory, 18765).init(); opened.push(store); return store; };
+  const open = async () => { const store = await new Store(directory, 18765, { now: () => NOW }).init(); opened.push(store); return store; };
   t.after(async () => { for (const store of opened) store.close(); await fs.rm(directory, { recursive: true, force: true }); });
   const store = await open();
   await store.saveConfig(config);
@@ -81,10 +82,49 @@ test('SQLite store survives concurrent writes, dedup, restart and reprice', asyn
   const result = summarize(third.db, { ...config, prices: config.prices.map(p => ({ ...p, output: 16 })) }, {}, Date.parse('2026-10-26T10:00:00Z'));
   assert.ok(result.totals.cost > summarize(third.db, config, {}, Date.parse('2026-10-26T10:00:00Z')).totals.cost);
 });
+test('recent requests are paginated without a fixed cap', async t => {
+  const values = Array.from({ length: 25 }, (_, i) => event('page_' + i, new Date(NOW - (i + 1) * 60000).toISOString()));
+  const store = await memoryStore(t, values);
+  const first = summarize(store.db, config, { range: 'today', page: 1, size: 10 }, NOW);
+  assert.equal(first.recent.total, 25); assert.equal(first.recent.pages, 3); assert.equal(first.recent.items.length, 10);
+  assert.equal(first.recent.items[0].id, 'page_0');
+  const last = summarize(store.db, config, { range: 'today', page: 3, size: 10 }, NOW);
+  assert.equal(last.recent.items.length, 5); assert.equal(last.recent.items.at(-1).id, 'page_24');
+  assert.equal(summarize(store.db, config, { range: 'today', page: 99, size: 10 }, NOW).recent.page, 3);
+  assert.equal(summarize(store.db, config, { range: 'today', page: 2, size: 10, model: 'other' }, NOW).recent.total, 0);
+});
+test('bucket average and median skip periods without requests', async t => {
+  const small = normalizeUsage({ prompt_tokens: 500, completion_tokens: 0 });
+  const store = await memoryStore(t, [
+    event('a', '2026-10-26T01:00:00Z'), event('b', '2026-10-26T01:30:00Z'),
+    event('c', '2026-10-26T02:00:00Z'), event('d', '2026-10-26T01:40:00Z', { usage: small })
+  ]);
+  const result = summarize(store.db, config, { range: 'today' }, NOW);
+  assert.deepEqual(result.bucketStats, { count: 2, average: 2050, median: 2050 });
+});
+test('request titles and structural summaries are stored without message content', async t => {
+  const store = await memoryStore(t, [event('titled', '2026-10-26T09:00:00Z', { title: ' 生成周报 ', summary: '3 条消息 · 流式输出', prompt: 'never-persist-this' })]);
+  const result = summarize(store.db, config, {}, NOW);
+  assert.equal(result.recent.items[0].title, '生成周报');
+  assert.equal(result.recent.items[0].summary, '3 条消息 · 流式输出');
+  assert.ok(!JSON.stringify(store.allEvents()).includes('never-persist-this'));
+});
+test('events older than one year are removed when the store starts', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-retention-'));
+  const opened = [];
+  const open = async () => { const store = await new Store(directory, 18765, { now: () => NOW }).init(); opened.push(store); return store; };
+  t.after(async () => { for (const store of opened) store.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  const store = await open();
+  await store.add(event('old', '2025-10-25T00:00:00Z'));
+  await store.add(event('kept', '2025-10-26T11:00:00Z'));
+  store.close();
+  const restarted = await open();
+  assert.deepEqual(restarted.allEvents().map(e => e.id), ['kept']);
+});
 test('legacy JSONL files are imported into SQLite once and then removed', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-migrate-'));
   const opened = [];
-  const open = async () => { const store = await new Store(directory, 18765).init(); opened.push(store); return store; };
+  const open = async () => { const store = await new Store(directory, 18765, { now: () => NOW }).init(); opened.push(store); return store; };
   t.after(async () => { for (const store of opened) store.close(); await fs.rm(directory, { recursive: true, force: true }); });
   const events = path.join(directory, 'events');
   await fs.mkdir(events);
@@ -101,12 +141,12 @@ test('legacy JSONL files are imported into SQLite once and then removed', async 
 test('import validates the whole file, dedups within the batch and keeps the import source', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-import-'));
   const opened = [];
-  const open = async () => { const store = await new Store(directory, 18765).init(); opened.push(store); return store; };
+  const open = async () => { const store = await new Store(directory, 18765, { now: () => NOW }).init(); opened.push(store); return store; };
   t.after(async () => { for (const store of opened) store.close(); await fs.rm(directory, { recursive: true, force: true }); });
   const store = await open();
   await assert.rejects(store.importEvents([event('bad/id', '2026-10-26T09:00:00Z')]), /记录 ID/);
   assert.equal(store.allEvents().length, 0);
-  const values = Array.from({ length: 400 }, (_, i) => event('imp_' + i, '2025-' + (i % 2 ? '09' : '10') + '-0' + (i % 8 + 1) + 'T09:00:00Z'));
+  const values = Array.from({ length: 400 }, (_, i) => event('imp_' + i, '2026-' + (i % 2 ? '09' : '10') + '-0' + (i % 8 + 1) + 'T09:00:00Z'));
   values.push(values[0]);
   assert.deepEqual(await store.importEvents(values), { added: 400, skipped: 1 });
   assert.equal(store.allEvents().length, 400);

@@ -128,6 +128,21 @@ test('proxy records upstream HTTP failures without inventing token usage', async
   assert.equal(ctx.store.allEvents()[0].usage, null);
 });
 
+test('proxy records an explicit title and structural summary without message content', async t => {
+  const ctx = await setup(t, {
+    upstream: async (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ model: 'deepseek-chat', usage: { prompt_tokens: 10, completion_tokens: 5 } }));
+    }
+  });
+  const response = await request(ctx.port, { body: { model: 'deepseek-chat', title: '  生成周报  ', stream: true, messages: [{ role: 'user', content: 'TOP-SECRET' }], tools: [{ type: 'function' }] } });
+  assert.equal(response.status, 200);
+  const event = ctx.store.allEvents()[0];
+  assert.equal(event.title, '生成周报');
+  assert.equal(event.summary, '1 条消息 · 1 个工具 · 流式输出');
+  assert.ok(!JSON.stringify(ctx.store.allEvents()).includes('TOP-SECRET'));
+});
+
 test('local-only guard, route validation and API key requirement run before any upstream call', async t => {
   const ctx = await setup(t, { upstream: async (_req, res) => { res.writeHead(200); res.end('{}'); } });
   assert.equal((await request(ctx.port, { body: { model: 'deepseek-chat' }, headers: { host: 'example.com' } })).status, 403);
