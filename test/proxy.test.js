@@ -9,7 +9,7 @@ const zlib = require('node:zlib');
 const { randomBytes } = require('node:crypto');
 const { Store } = require('../src/store');
 const { DEFAULT_CONFIG } = require('../src/config');
-const { createMeterServer, headersFor, upstreamTarget } = require('../src/proxy');
+const { createMeterServer, headersFor, upstreamTarget, describeRequest } = require('../src/proxy');
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -141,19 +141,42 @@ test('proxy records upstream HTTP failures without inventing token usage', async
   assert.equal(ctx.store.allEvents()[0].usage, null);
 });
 
-test('proxy records an explicit title and structural summary without message content', async t => {
+test('proxy records a bounded user excerpt with the explicit title and structural summary', async t => {
   const ctx = await setup(t, {
     upstream: async (_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ model: 'deepseek-chat', usage: { prompt_tokens: 10, completion_tokens: 5 } }));
     }
   });
-  const response = await request(ctx.port, { body: { model: 'deepseek-chat', title: '  生成周报  ', stream: true, messages: [{ role: 'user', content: 'TOP-SECRET' }], tools: [{ type: 'function' }] } });
+  const response = await request(ctx.port, { body: { model: 'deepseek-chat', title: '  生成周报  ', stream: true, max_tokens: 384000,
+    messages: [
+      { role: 'system', content: 'SYSTEM-SECRET' },
+      { role: 'user', content: '请帮我总结这份周报，提炼关键进展和风险。USER-TAIL' },
+      { role: 'assistant', content: 'ASSISTANT-SECRET' }
+    ], tools: [{ type: 'function' }] } });
   assert.equal(response.status, 200);
   const event = ctx.store.allEvents()[0];
   assert.equal(event.title, '生成周报');
-  assert.equal(event.summary, '1 条消息 · 1 个工具 · 流式输出');
-  assert.ok(!JSON.stringify(ctx.store.allEvents()).includes('TOP-SECRET'));
+  assert.equal(event.summary, '请求：请帮我总结这份周报，提炼关键进展和风险。USER-TAIL · 3 条消息 · 1 个工具 · 流式输出 · 上限 384000 Tokens');
+  assert.ok(!JSON.stringify(ctx.store.allEvents()).includes('SYSTEM-SECRET'));
+  assert.ok(!JSON.stringify(ctx.store.allEvents()).includes('ASSISTANT-SECRET'));
+});
+
+test('request excerpts support text blocks, redact common secrets, cap length and identify multimodal input', () => {
+  const apiKey = 'sk-' + 'x'.repeat(32);
+  const result = describeRequest({ input: [
+    { type: 'message', role: 'system', content: [{ type: 'input_text', text: 'SYSTEM-SECRET' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '请分析日志里的 api_key=private-value 并检查 ' + apiKey + '。' + '补充背景。'.repeat(30) }] }
+  ] });
+  assert.match(result.summary, /^请求：请分析日志里的 api_key=\[已隐藏\] 并检查 sk-\[已隐藏\]/);
+  assert.ok(!result.summary.includes(apiKey));
+  assert.ok(!result.summary.includes('SYSTEM-SECRET'));
+  assert.ok(Array.from(result.summary.slice('请求：'.length).split(' · ')[0]).length <= 80);
+
+  const image = describeRequest({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://private.example/image.png' } }] }] });
+  assert.match(image.summary, /^请求：图片输入/);
+  assert.ok(!image.summary.includes('private.example'));
+  assert.equal(describeRequest({}).summary, '模型生成请求');
 });
 
 test('local-only guard, route validation and API key requirement run before any upstream call', async t => {

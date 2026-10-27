@@ -51,8 +51,64 @@ function upstreamTarget(base, endpoint, query) {
 function cleanText(value, limit) {
   return typeof value === 'string' ? value.replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, limit) : '';
 }
-// Only an explicit title plus structural facts are kept; message content is never recorded.
+const PROMPT_PREVIEW_LIMIT = 80;
+const TEXT_BLOCK_TYPES = new Set(['text', 'input_text', 'output_text']);
 const TITLE_KEYS = ['title', 'name', 'conversation_title', 'session_title'];
+function contentPreview(content) {
+  const blocks = Array.isArray(content) ? content : [content];
+  let hint = '';
+  for (const block of blocks) {
+    if (typeof block === 'string' && block.trim()) return block;
+    if (!block || typeof block !== 'object') continue;
+    const type = typeof block.type === 'string' ? block.type.toLowerCase() : '';
+    if (TEXT_BLOCK_TYPES.has(type) && typeof block.text === 'string' && block.text.trim()) return block.text;
+    if (!hint) {
+      if (type.includes('image')) hint = '图片输入';
+      else if (type.includes('audio')) hint = '音频输入';
+      else if (type.includes('video')) hint = '视频输入';
+      else if (type.includes('file')) hint = '文件输入';
+    }
+  }
+  return hint;
+}
+function firstUserPreview(messages) {
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role !== 'user') continue;
+    const preview = contentPreview(message.content);
+    if (preview) return preview;
+  }
+  return '';
+}
+function inputPreview(input) {
+  if (typeof input === 'string') return input;
+  for (const item of Array.isArray(input) ? input : []) {
+    if (typeof item === 'string' && item.trim()) return item;
+    if (item?.role === 'user') {
+      const preview = contentPreview(item.content);
+      if (preview) return preview;
+    }
+    if (TEXT_BLOCK_TYPES.has(item?.type)) {
+      const preview = contentPreview(item);
+      if (preview) return preview;
+    }
+  }
+  return '';
+}
+function promptPreview(object) {
+  const raw = firstUserPreview(object.messages) || inputPreview(object.input) || contentPreview(object.prompt);
+  if (!raw) return '';
+  const sanitized = raw.slice(0, 512)
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [已隐藏]')
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, 'sk-[已隐藏]')
+    .replace(/\b(api[_-]?key|access[_-]?token|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, '$1=[已隐藏]')
+    .replace(/([?&](?:key|token|access_token|api_key)=)[^&\s]+/gi, '$1[已隐藏]')
+    .replace(/[\x00-\x20\x7f]+/g, ' ').trim();
+  const chars = Array.from(sanitized);
+  return chars.length > PROMPT_PREVIEW_LIMIT
+    ? chars.slice(0, PROMPT_PREVIEW_LIMIT - 1).join('') + '…'
+    : chars.join('');
+}
+// Persist a short, redacted excerpt from the first user input, never the full conversation.
 function describeRequest(object) {
   const meta = object.metadata && typeof object.metadata === 'object' ? object.metadata : {};
   const candidate = [...TITLE_KEYS.map(key => object[key]), ...TITLE_KEYS.map(key => meta[key])]
@@ -60,7 +116,8 @@ function describeRequest(object) {
   const messages = Array.isArray(object.messages) ? object.messages.length : Array.isArray(object.input) ? object.input.length : 0;
   const tools = Array.isArray(object.tools) ? object.tools.length : 0;
   const limit = object.max_tokens ?? object.max_completion_tokens;
-  const parts = [];
+  const preview = promptPreview(object);
+  const parts = [preview ? '请求：' + preview : '模型生成请求'];
   if (messages) parts.push(messages + ' 条消息');
   if (tools) parts.push(tools + ' 个工具');
   if (object.stream === true) parts.push('流式输出');

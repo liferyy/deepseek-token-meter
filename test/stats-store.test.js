@@ -203,7 +203,7 @@ test('bucket average and median skip periods without requests', async t => {
   const result = summarize(store.db, config, { range: 'today' }, NOW);
   assert.deepEqual(result.bucketStats, { count: 2, average: 2050, median: 2050 });
 });
-test('request titles and structural summaries are stored without message content', async t => {
+test('request records store only the supplied title and bounded summary fields', async t => {
   const store = await memoryStore(t, [event('titled', '2026-10-26T09:00:00Z', { title: ' 生成周报 ', summary: '3 条消息 · 流式输出', prompt: 'never-persist-this' })]);
   const result = summarize(store.db, config, {}, NOW);
   assert.equal(result.recent.items[0].title, '生成周报');
