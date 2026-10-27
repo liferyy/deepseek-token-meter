@@ -30,7 +30,7 @@ npm test
 npm run package
 ```
 
-然后在编辑器的扩展面板中选择“从 VSIX 安装”，安装生成的 `deepseek-token-meter-1.2.3.vsix`。
+然后在编辑器的扩展面板中选择“从 VSIX 安装”，安装生成的 `deepseek-token-meter-<版本号>.vsix`。
 
 ### 2. 启动本机代理
 

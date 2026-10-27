@@ -38,7 +38,7 @@
   "scripts": {
     "test": "node --test",
     "check": "node scripts/check.js",
-    "package": "node scripts/bump-version.js && vsce package --no-dependencies --baseContentUrl https://gitee.com/teddyFei/deepseek-token-meter/blob/master --baseImagesUrl https://gitee.com/teddyFei/deepseek-token-meter/raw/master",
+    "package": "node scripts/bump-version.js && vsce package --no-dependencies --baseContentUrl https://github.com/liferyy/deepseek-token-meter/blob/master --baseImagesUrl https://github.com/liferyy/deepseek-token-meter/raw/master",
     "preview": "node scripts/preview.js"
   },
   "devDependencies": { "@vscode/vsce": "^3.7.1", "@types/vscode": "^1.85.0" },
