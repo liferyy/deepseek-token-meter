@@ -244,6 +244,29 @@ test('proxy pushes throttled change events to dashboards after committed writes'
   assert.equal(ctx.store.allEvents().length, 2);
 });
 
+test('summary endpoint returns current-day totals without dashboard detail', async t => {
+  const ctx = await setup(t);
+  await ctx.store.add({ id: 'summary_1', startedAt: new Date().toISOString(), model: 'deepseek-chat', status: 'success',
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0 } });
+  const response = await request(ctx.port, { path: '/_meter/summary', headers: { 'x-meter-token': ctx.token } });
+  assert.equal(response.status, 200);
+  const value = JSON.parse(response.body.toString('utf8'));
+  assert.equal(value.totals.requests, 1);
+  assert.equal(value.totals.total, 15);
+  assert.equal(value.service.running, true);
+  assert.equal(value.heatmap, undefined);
+  assert.equal(value.recent, undefined);
+});
+
+test('state endpoint can omit the heatmap for non-overview views', async t => {
+  const ctx = await setup(t);
+  const response = await request(ctx.port, { path: '/_meter/state?range=today&includeHeatmap=false', headers: { 'x-meter-token': ctx.token } });
+  assert.equal(response.status, 200);
+  const value = JSON.parse(response.body.toString('utf8'));
+  assert.equal(value.heatmap, undefined);
+  assert.equal(value.totals.requests, 0);
+});
+
 test('clear requires the typed confirmation and keeps model prices', async t => {
   const ctx = await setup(t, { upstream: async (_req, res) => { res.writeHead(200); res.end('{}'); } });
   const event = id => ({ id, startedAt: '2026-10-26T09:00:00Z', model: 'deepseek-chat', status: 'success',

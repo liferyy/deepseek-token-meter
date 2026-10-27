@@ -4,8 +4,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { summarize, dailyCsv, midnight, dateKey } = require('../src/stats');
-const { Store } = require('../src/store');
+const { summarize, summarizeTotals, dailyCsv, midnight, dateKey } = require('../src/stats');
+const { Store, cleanEvent } = require('../src/store');
+const { openDatabase, insertEvent, INSERT_SQL, ROLLUP_VERSION } = require('../src/db');
 const { DEFAULT_CONFIG } = require('../src/config');
 const { normalizeUsage } = require('../src/usage');
 const usage = normalizeUsage({ prompt_tokens: 1000, prompt_cache_hit_tokens: 900, completion_tokens: 200 });
@@ -26,9 +27,71 @@ test('Beijing midnight, hourly buckets and model filters use configured local da
   const result = summarize(store.db, config, { range: 'today' }, now);
   assert.equal(result.totals.requests, 2); assert.equal(result.buckets.length, 24); assert.equal(result.buckets[0].requests, 1);
   assert.equal(result.totals.total, 2400); assert.equal(result.totals.unpriced, 1); assert.equal(result.totals.cacheHitRate, .9);
+  const todayActivity = result.heatmap.find(day => day.date === '2026-10-26');
+  assert.equal(todayActivity.requests, 2);
+  assert.equal(todayActivity.total, 2400);
   assert.equal(summarize(store.db, config, { range: 'today', model: 'deepseek-chat' }, now).totals.requests, 1);
   assert.deepEqual(result.allModels, ['deepseek-chat', 'other']);
   assert.equal(dateKey(midnight('2026-10-26', config.timezone), config.timezone), '2026-10-26');
+});
+test('status totals match the dashboard without computing a heatmap', async t => {
+  const store = await memoryStore(t, [
+    event('summary-a', '2026-10-26T02:00:00Z'),
+    event('summary-b', '2026-10-26T04:00:00Z', { status: 'error', usage: null })
+  ]);
+  const full = summarize(store.db, config, { range: 'today' }, NOW);
+  const light = summarize(store.db, config, { range: 'today', includeHeatmap: false }, NOW);
+  assert.equal(light.heatmap, undefined);
+  assert.deepEqual(summarizeTotals(store.db, config, NOW), full.totals);
+  assert.deepEqual(light.totals, full.totals);
+});
+test('heatmap falls back to events when hourly buckets cross local midnight', async t => {
+  const store = await memoryStore(t, [
+    event('nepal-before-midnight', '2026-10-25T18:10:00Z'),
+    event('nepal-after-midnight', '2026-10-25T18:20:00Z')
+  ]);
+  const zoneConfig = { ...config, timezone: 'Asia/Kathmandu' };
+  const result = summarize(store.db, zoneConfig, { range: 'today' }, Date.parse('2026-10-26T12:00:00Z'));
+  const previousDay = result.heatmap.find(day => day.date === '2026-10-25');
+  const today = result.heatmap.find(day => day.date === '2026-10-26');
+  assert.equal(previousDay.requests, 1);
+  assert.equal(today.requests, 1);
+});
+test('hourly heatmap rollup matches event aggregation for aligned timezone days', async t => {
+  const values = [
+    event('rollup-peak', '2026-10-26T01:10:00Z'),
+    event('rollup-missing', '2026-10-26T02:50:00Z', { status: 'error', usage: null }),
+    event('rollup-partial', '2026-10-26T03:15:00Z', { status: 'cancelled', partial: true, requestedModel: 'deepseek-coder' }),
+    event('rollup-offpeak', '2026-10-26T04:10:00Z'),
+    event('rollup-unpriced', '2026-10-26T05:10:00Z', { model: 'unpriced', requestedModel: 'other' })
+  ];
+  const store = await memoryStore(t, values);
+  const eventsDb = openDatabase(':memory:');
+  t.after(() => eventsDb.close());
+  const insert = eventsDb.prepare(INSERT_SQL);
+  for (const value of values) insertEvent(insert, cleanEvent(value));
+
+  const rolledUp = summarize(store.db, { ...config, timezone: 'Asia/Shanghai' }, { range: 'today' }, NOW);
+  const fromEvents = summarize(eventsDb, { ...config, timezone: 'Asia/Kathmandu' }, { range: 'today' }, NOW);
+  assert.deepEqual(rolledUp.heatmap, fromEvents.heatmap);
+  const today = rolledUp.heatmap.find(day => day.date === '2026-10-26');
+  assert.equal(today.errors, 1);
+  assert.equal(today.cancelled, 1);
+  assert.equal(today.partialUsage, 1);
+  assert.equal(today.unpriced, 1);
+  assert.ok(today.costPeak > 0);
+  assert.ok(today.costOffPeak > 0);
+});
+test('heatmap cache refreshes after a write or price change', async t => {
+  const store = await memoryStore(t, [event('cache-first', '2026-10-26T02:00:00Z')]);
+  const first = summarize(store.db, config, { range: 'today' }, NOW).heatmap.find(day => day.date === '2026-10-26');
+  await store.add(event('cache-second', '2026-10-26T02:00:00Z'));
+  const afterWrite = summarize(store.db, config, { range: 'today' }, NOW + 1000).heatmap.find(day => day.date === '2026-10-26');
+  const repriced = summarize(store.db, { ...config, prices: [{ ...config.prices[0], input: 4 }] },
+    { range: 'today' }, NOW + 2000).heatmap.find(day => day.date === '2026-10-26');
+  assert.equal(first.requests, 1);
+  assert.equal(afterWrite.requests, 2);
+  assert.ok(repriced.cost > afterWrite.cost);
 });
 test('peak and off-peak costs are split by request start time', async t => {
   const tokens = normalizeUsage({ prompt_tokens: 1000000, completion_tokens: 0 });
@@ -96,6 +159,30 @@ test('SQLite store survives concurrent writes, dedup, restart and reprice', asyn
   const result = summarize(third.db, { ...config, prices: config.prices.map(p => ({ ...p, output: 16 })) }, {}, Date.parse('2026-10-26T10:00:00Z'));
   assert.ok(result.totals.cost > summarize(third.db, config, {}, Date.parse('2026-10-26T10:00:00Z')).totals.cost);
 });
+test('existing event rows are rolled up once when the database is upgraded', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-rollup-migrate-'));
+  const opened = [];
+  t.after(async () => { for (const store of opened) store.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  const legacyDb = openDatabase(path.join(directory, 'usage.db'));
+  insertEvent(legacyDb.prepare(INSERT_SQL), cleanEvent(event('pre-rollup', '2026-10-26T02:00:00Z')));
+  legacyDb.close();
+
+  const store = await new Store(directory, 18765, { now: () => NOW }).init();
+  opened.push(store);
+  assert.equal(store.db.prepare("SELECT value FROM meta WHERE key = 'rollup_version'").get().value, ROLLUP_VERSION);
+  let row = store.db.prepare('SELECT requests, input FROM rollup').get();
+  assert.equal(row.requests, 1);
+  assert.equal(row.input, usage.input);
+  store.close();
+  const reopened = await new Store(directory, 18765, { now: () => NOW }).init();
+  opened.push(reopened);
+  row = reopened.db.prepare('SELECT requests, input FROM rollup').get();
+  assert.equal(row.requests, 1);
+  assert.equal(row.input, usage.input);
+  assert.equal(Number(reopened.db.prepare('PRAGMA auto_vacuum').get().auto_vacuum), 0);
+  await reopened.maintenance();
+  assert.equal(Number(reopened.db.prepare('PRAGMA auto_vacuum').get().auto_vacuum), 2);
+});
 test('recent requests are paginated without a fixed cap', async t => {
   const values = Array.from({ length: 25 }, (_, i) => event('page_' + i, new Date(NOW - (i + 1) * 60000).toISOString()));
   const store = await memoryStore(t, values);
@@ -145,6 +232,11 @@ test('clearing all usage keeps configuration and reclaims free pages', async t =
   assert.equal(store.allEvents().length, 300);
   const file = path.join(directory, 'usage.db');
   const before = (await fs.stat(file)).size;
+  store.db.exec("CREATE TRIGGER reject_rollup_clear BEFORE DELETE ON rollup BEGIN SELECT RAISE(ABORT, 'rollup clear rejected'); END");
+  assert.throws(() => store.clearAll(), /rollup clear rejected/);
+  assert.equal(store.allEvents().length, 300);
+  assert.equal(Number(store.db.prepare('SELECT SUM(requests) AS n FROM rollup').get().n), 300);
+  store.db.exec('DROP TRIGGER reject_rollup_clear');
   assert.equal(store.clearAll(), 300);
   assert.equal(store.allEvents().length, 0);
   assert.deepEqual(store.config.prices, config.prices);

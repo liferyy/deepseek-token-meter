@@ -5,7 +5,7 @@ const https = require('node:https');
 const zlib = require('node:zlib');
 const { randomUUID, timingSafeEqual } = require('node:crypto');
 const { UsageCollector } = require('./usage');
-const { summarize, dailyCsv } = require('./stats');
+const { summarize, summarizeTotals, dailyCsv } = require('./stats');
 const { load: loadHolidays } = require('./holidays');
 const { version: VERSION } = require('../package.json');
 
@@ -119,6 +119,10 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
           heartbeat.unref?.();
           res.once('close', () => { clearInterval(heartbeat); streams.delete(res); });
           return;
+        }
+        if (req.method === 'GET' && url.pathname === '/_meter/summary') {
+          return json(res, 200, { totals: summarizeTotals(store.db, store.config),
+            service: { running: true, port, active, revision: store.revision, dataDirectory: store.directory }, warnings: store.warnings });
         }
         if (req.method === 'GET' && url.pathname === '/_meter/state') {
           // Pick up holiday data refreshed by a newer editor window before recalculating peak/off-peak.

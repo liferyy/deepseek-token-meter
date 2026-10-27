@@ -3,7 +3,9 @@
 // All aggregation runs inside SQLite: only per-day/model groups are read into memory, never every event.
 const { rateFor, costAt } = require('./config');
 const { isPeak } = require('./peak');
+const { status: holidayStatus } = require('./holidays');
 const { DAY, dateParts, dateKey, midnight, shiftDate } = require('./time');
+const HOUR_MS = 3600000;
 
 const GROUP_COLUMNS = `
   COUNT(*) AS requests,
@@ -47,6 +49,37 @@ function groupedRows(db, keyExpression, keyParams, from, to, model) {
   if (model) { where.push('model = ?'); params.push(model); }
   const sql = `SELECT ${keyExpression} AS bucket, model, requested_model, meter_peak(started_at) AS peak, ${GROUP_COLUMNS} FROM events` +
     (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' GROUP BY bucket, model, requested_model, peak';
+  return db.prepare(sql).all(...params);
+}
+
+const hourlyZoneCache = new Map();
+function hourlyRollupFitsDays(zone, today) {
+  const first = shiftDate(today, -364), last = shiftDate(today, 1);
+  const key = zone + '|' + first.slice(0, 4) + '|' + last.slice(0, 4);
+  if (hourlyZoneCache.has(key)) return hourlyZoneCache.get(key);
+  let fits = true;
+  for (let date = first; date <= last; date = shiftDate(date, 1)) {
+    if (midnight(date, zone) % HOUR_MS !== 0) { fits = false; break; }
+  }
+  if (hourlyZoneCache.size >= 32) hourlyZoneCache.clear();
+  hourlyZoneCache.set(key, fits);
+  return fits;
+}
+
+// The hourly rollup preserves peak classification because Beijing pricing windows and day
+// boundaries align to UTC hours. Non-hour-aligned local days use events so their edge hours split exactly.
+function groupedRollupRows(db, zone, from, to, model) {
+  const where = ['hour >= ?', 'hour < ?'];
+  const params = [zone, Math.floor(from / HOUR_MS), Math.ceil(to / HOUR_MS)];
+  if (model) { where.push('model = ?'); params.push(model); }
+  const sql = `SELECT meter_day(hour * ${HOUR_MS}, ?) AS bucket, model, requested_model,
+    meter_peak(hour * ${HOUR_MS}) AS peak,
+    SUM(requests) AS requests, SUM(success) AS success, SUM(errors) AS errors,
+    SUM(cancelled) AS cancelled, SUM(missing_usage) AS missing_usage,
+    SUM(partial_usage) AS partial_usage, SUM(usage_requests) AS usage_requests,
+    SUM(input) AS input, SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write,
+    SUM(output) AS output, SUM(reasoning) AS reasoning FROM rollup WHERE ${where.join(' AND ')}
+    GROUP BY bucket, model, requested_model, peak`;
   return db.prepare(sql).all(...params);
 }
 
@@ -114,27 +147,40 @@ function recentPage(db, range, model, query) {
   return { items, total, page, size, pages };
 }
 
-// The activity grid always scans 365 days, which is the most expensive part of every refresh.
-// A dashboard can refresh after each push (at most once every three seconds), so the grid is
-// reused for a short window; it only shows a day's totals, which do not visibly change that fast.
-const HEATMAP_TTL_MS = 10000;
+// The grid changes only when its source rows or billing inputs change. Keying those inputs lets
+// frequent SSE refreshes reuse it without hiding a single write that arrives just after a refresh.
 const heatmapCache = new WeakMap();
-function heatmapFor(db, config, model, today, now) {
-  const key = config.timezone + '|' + (model || '') + '|' + today + '|' + Math.floor(now / HEATMAP_TTL_MS);
+function heatmapFor(db, config, model, today) {
+  const dataVersion = db.prepare('PRAGMA data_version').get().data_version;
+  const localChanges = db.prepare('SELECT total_changes() AS n').get().n;
+  const key = JSON.stringify([config.timezone, model || '', today, dataVersion, localChanges,
+    config.ignoreHolidays === true, config.prices, holidayStatus().updatedAt]);
   const cached = heatmapCache.get(db);
   if (cached?.key === key) return cached.value;
   const zone = config.timezone;
-  const heatFrom = midnight(shiftDate(today, -370), zone);
+  const first = shiftDate(today, -364);
+  const heatFrom = midnight(first, zone);
   const heatTo = midnight(shiftDate(today, 1), zone);
   const map = new Map();
-  for (const row of groupedRows(db, 'meter_day(started_at, ?)', [zone], heatFrom, heatTo, model)) {
+  const rows = hourlyRollupFitsDays(zone, today)
+    ? groupedRollupRows(db, zone, heatFrom, heatTo, model)
+    : groupedRows(db, 'meter_day(started_at, ?)', [zone], heatFrom, heatTo, model);
+  for (const row of rows) {
     if (!map.has(row.bucket)) map.set(row.bucket, blank({ date: row.bucket }));
     accumulateGroup(map.get(row.bucket), row, config.prices);
   }
   const value = [];
-  for (let date = shiftDate(today, -364); date <= today; date = shiftDate(date, 1)) value.push(map.get(date) || blank({ date }));
+  for (let date = first; date <= today; date = shiftDate(date, 1)) value.push(map.get(date) || blank({ date }));
   heatmapCache.set(db, { key, value });
   return value;
+}
+
+function summarizeTotals(db, config, now = Date.now()) {
+  const range = makeRange({ range: 'today' }, config.timezone, now);
+  const totals = blank();
+  for (const row of groupedRows(db, '0', [], range.from, range.to)) accumulateGroup(totals, row, config.prices);
+  totals.cacheHitRate = totals.prompt ? totals.cacheRead / totals.prompt : null;
+  return totals;
 }
 
 function summarize(db, config, query = {}, now = Date.now()) {
@@ -173,13 +219,14 @@ function summarize(db, config, query = {}, now = Date.now()) {
   totals.cacheHitRate = totals.prompt ? totals.cacheRead / totals.prompt : null;
 
   const today = dateKey(now, zone);
-  const heatmap = heatmapFor(db, config, query.model, today, now);
+  const heatmap = query.includeHeatmap === false || query.includeHeatmap === 'false'
+    ? undefined : heatmapFor(db, config, query.model, today);
 
   const recent = recentPage(db, range, query.model, query);
   const allModels = db.prepare('SELECT DISTINCT model FROM events ORDER BY model').all().map(row => row.model);
   return { range, timezone: zone, totals, buckets, bucketStats: bucketStatistics(buckets),
     models: [...models.values()].sort((a, b) => b.total - a.total),
-    allModels, heatmap, recent, generatedAt: new Date(now).toISOString() };
+    allModels, ...(heatmap ? { heatmap } : {}), recent, generatedAt: new Date(now).toISOString() };
 }
 
 // The export follows the range and model filter currently shown in the panel; the same rows are
@@ -199,4 +246,4 @@ function dailyCsv(db, config, query = {}, now = Date.now()) {
   return '\ufeff' + headers.map(escape).join(',') + '\r\n' + [...rows.values()].sort((a, b) => a.date.localeCompare(b.date) || a.model.localeCompare(b.model)).map(row => fields.map(k => escape(moneyKeys.includes(k) ? row[k].toFixed(8) : row[k])).join(',')).join('\r\n') + '\r\n';
 }
 
-module.exports = { summarize, dailyCsv, rowToEvent, dateKey, midnight, makeRange, shiftDate, blank, RECENT_SIZES, DEFAULT_RECENT_SIZE };
+module.exports = { summarize, summarizeTotals, dailyCsv, rowToEvent, dateKey, midnight, makeRange, shiftDate, blank, RECENT_SIZES, DEFAULT_RECENT_SIZE };

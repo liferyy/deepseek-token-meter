@@ -20,12 +20,13 @@
     toastTimer = setTimeout(() => { $('toast').hidden = true; }, error ? 10000 : 4500);
   }
   function persist() { bridge?.setState?.({ query, tab: editingConfig || 'overview' }); }
-  function refresh() { persist(); post('refresh', { query }); }
-  function tab(name) {
+  function refresh() { persist(); post('refresh', { query, includeHeatmap: editingConfig === 'overview' }); }
+  function tab(name, requestState = true) {
     editingConfig = name;
     for (const panel of document.querySelectorAll('.tab-panel')) panel.hidden = panel.id !== name;
     for (const button of document.querySelectorAll('[data-tab]')) button.classList.toggle('selected', button.dataset.tab === name);
     persist(); if (name === 'overview') requestAnimationFrame(drawChart);
+    if (requestState) refresh();
   }
   function updateRangeButtons() {
     for (const b of document.querySelectorAll('[data-range]')) b.classList.toggle('selected', b.dataset.range === query.range);
@@ -38,7 +39,8 @@
     return new Intl.DateTimeFormat('zh-CN', { timeZone: state?.timezone || 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(value));
   }
   function render(value) {
-    state = value;
+    const heatmap = Array.isArray(value.heatmap) ? value.heatmap : state?.heatmap;
+    state = { ...value, ...(heatmap ? { heatmap } : {}) };
     const t = value.totals, service = value.service;
     $('service-pill').classList.toggle('stopped', !service.running);
     $('service-pill').lastElementChild.textContent = service.running ? '代理运行中 · ' + service.port : '代理已停止';
@@ -88,7 +90,7 @@
     }
     $('known-models').replaceChildren();
     for (const model of [...new Set([...value.allModels, 'deepseek-chat', 'deepseek-reasoner', 'deepseek-flash', 'deepseek-v4-pro'])]) { const option = node('option'); option.value = model; $('known-models').append(option); }
-    drawGauge(t.cacheHitRate); drawChart(); drawHeatmap(); renderModels(); renderRecent(); updateRangeButtons();
+    drawGauge(t.cacheHitRate); drawChart(); if (Array.isArray(value.heatmap)) drawHeatmap(); renderModels(); renderRecent(); updateRangeButtons();
   }
   function drawGauge(rate) {
     const s = svg('svg', { viewBox: '0 0 220 112', role: 'img', 'aria-label': rate == null ? '缓存命中率暂无数据' : '缓存命中率 ' + (rate * 100).toFixed(2) + '%' });
@@ -262,7 +264,7 @@
   for (const button of document.querySelectorAll('[data-range]')) button.addEventListener('click', () => {
     query.range = button.dataset.range; query.page = 1; updateRangeButtons();
     if (query.range === 'custom') {
-      if (!query.from) { query.from = state?.heatmap.at(-1)?.date || new Date().toISOString().slice(0, 10); query.to = query.from; }
+      if (!query.from) { query.from = state?.heatmap?.at(-1)?.date || new Date().toISOString().slice(0, 10); query.to = query.from; }
       $('date-from').value = query.from; $('date-to').value = query.to;
     } else refresh();
   });
@@ -291,9 +293,9 @@
   });
   $('open-data').addEventListener('click', () => post('openData')); $('empty-connect').addEventListener('click', () => tab('settings'));
   window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawChart, 100); });
-  updateRangeButtons(); tab(saved.tab || 'overview'); if (query.from) $('date-from').value = query.from; if (query.to) $('date-to').value = query.to;
+  updateRangeButtons(); tab(saved.tab || 'overview', false); if (query.from) $('date-from').value = query.from; if (query.to) $('date-to').value = query.to;
   if (![10, 20, 50, 100].includes(Number(query.size))) query.size = 20;
   if (!Number.isFinite(Number(query.page)) || Number(query.page) < 1) query.page = 1;
   $('page-size').value = String(query.size);
-  post('ready', { query });
+  post('ready', { query, includeHeatmap: editingConfig === 'overview' });
 })();

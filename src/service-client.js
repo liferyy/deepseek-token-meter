@@ -6,8 +6,9 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const { randomBytes, createHash } = require('node:crypto');
 const { Store } = require('./store');
-const { summarize } = require('./stats');
+const { summarize, summarizeTotals } = require('./stats');
 const { load: loadHolidays } = require('./holidays');
+const { version: VERSION } = require('../package.json');
 
 // A stopped proxy is retried with a growing delay so a closed or broken endpoint does not get a
 // request every three seconds for as long as the editor stays open.
@@ -19,7 +20,7 @@ function retryDelay(attempt) {
 
 class ServiceClient {
   constructor(directory, extensionPath, port) {
-    this.directory = directory; this.extensionPath = extensionPath; this.port = port; this.token = ''; this.starting = null;
+    this.directory = directory; this.extensionPath = extensionPath; this.port = port; this.token = ''; this.starting = null; this.serviceVersion = '';
     // While the proxy is stopped the dashboard still polls every few seconds; keep one database
     // connection instead of reopening the SQLite file on every poll.
     this.localStore = null; this.wasRunning = false;
@@ -85,7 +86,9 @@ class ServiceClient {
           let index;
           while ((index = buffer.indexOf('\n\n')) >= 0) {
             const block = buffer.slice(0, index); buffer = buffer.slice(index + 2);
-            if (/(?:^|\n)event: change(?:\r?\n|$)/.test(block)) { try { onChange(); } catch { /* handled by the caller */ } }
+            // `ready` carries the current revision, so treat every new connection as a chance to
+            // resync. This closes the gap between the extension's last refresh and SSE subscribe.
+            if (/(?:^|\n)event: (?:ready|change)(?:\r?\n|$)/.test(block)) { try { onChange(); } catch { /* handled by the caller */ } }
           }
           if (buffer.length > 65536) buffer = ''; // malformed or oversized frame
         });
@@ -107,12 +110,27 @@ class ServiceClient {
     try { result = await this.request('/_meter/health'); }
     catch (error) { if (['ECONNREFUSED', 'ECONNRESET'].includes(error.code)) return false; throw error; }
     if (result?.product !== 'deepseek-token-meter' || result.fingerprint !== this.fingerprint) throw new Error('端口 ' + this.port + ' 已被其他程序占用，请在插件设置中修改端口并重载窗口');
+    this.serviceVersion = typeof result.version === 'string' ? result.version : '';
+    return true;
+  }
+  async syncVersion() {
+    if (!(await this.health())) return false;
+    if (this.serviceVersion !== VERSION) await this.ensure();
     return true;
   }
   async ensure() {
     if (this.starting) return this.starting;
     this.starting = (async () => {
-      if (await this.health()) return;
+      if (await this.health()) {
+        if (this.serviceVersion === VERSION) return;
+        await this.request('/_meter/stop', 'POST');
+        let stopped = false;
+        for (let i = 0; i < 50; i++) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          if (!(await this.health())) { stopped = true; break; }
+        }
+        if (!stopped) throw new Error('旧版代理未能停止，请稍后重试');
+      }
       const child = spawn(process.execPath, [path.join(this.extensionPath, 'src', 'daemon.js'), this.directory, String(this.port)],
         { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: '' }, cwd: this.extensionPath, stdio: 'ignore', detached: true, windowsHide: true });
       let spawnError;
@@ -120,7 +138,7 @@ class ServiceClient {
       for (let i = 0; i < 50; i++) {
         if (spawnError) throw new Error('无法启动本机代理进程');
         await new Promise(resolve => setTimeout(resolve, 100));
-        if (await this.health()) return;
+        if (await this.health() && this.serviceVersion === VERSION) return;
       }
       // Surface corrupt data/config errors rather than replacing existing files.
       const probe = await new Store(this.directory, this.port).init();
@@ -129,8 +147,17 @@ class ServiceClient {
     })();
     try { await this.starting; } finally { this.starting = null; }
   }
-  async state(query) {
-    const search = new URLSearchParams(Object.entries(query || {}).filter(([, v]) => v != null && v !== ''));
+  async summary() {
+    if (await this.health()) { this.wasRunning = true; this.closeLocalStore(); return this.request('/_meter/summary'); }
+    if (this.wasRunning || !this.localStore) { this.closeLocalStore(); this.wasRunning = false; }
+    if (!this.localStore) this.localStore = await new Store(this.directory, this.port).init();
+    const store = this.localStore;
+    return { totals: summarizeTotals(store.db, store.config),
+      service: { running: false, active: 0, port: this.port, dataDirectory: store.directory }, warnings: store.warnings };
+  }
+  async state(query, includeHeatmap) {
+    const stateQuery = { ...(query || {}), ...(includeHeatmap == null ? {} : { includeHeatmap }) };
+    const search = new URLSearchParams(Object.entries(stateQuery).filter(([, v]) => v != null && v !== ''));
     if (await this.health()) { this.wasRunning = true; this.closeLocalStore(); return this.request('/_meter/state?' + search); }
     // The proxy may have written records and then stopped or crashed; reopen once on that transition.
     if (this.wasRunning || !this.localStore) { this.closeLocalStore(); this.wasRunning = false; }
@@ -138,7 +165,7 @@ class ServiceClient {
     const store = this.localStore;
     // A background refresh may have rewritten the holiday cache since this store was opened.
     const holidays = await loadHolidays(this.directory);
-    return { ...summarize(store.db, store.config, query), holidays, config: store.config,
+    return { ...summarize(store.db, store.config, stateQuery), holidays, config: store.config,
       service: { running: false, active: 0, port: this.port, dataDirectory: this.directory }, warnings: store.warnings };
   }
   closeLocalStore() { if (this.localStore) { this.localStore.close(); this.localStore = null; } }

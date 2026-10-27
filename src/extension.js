@@ -10,7 +10,7 @@ const { dateKey } = require('./time');
 const { RECENT_SIZES, DEFAULT_RECENT_SIZE } = require('./stats');
 const { createRefreshQueue } = require('./refresh-queue');
 
-let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, unwatch, streamUp = true;
+let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, unwatch, panelIncludeHeatmap = false;
 // The holiday cache covers whole years; check at most once a day (and every six hours after a
 // failure), so a window left open across New Year picks up the new year immediately.
 const HOLIDAY_RETRY_MS = 6 * 60 * 60 * 1000;
@@ -47,7 +47,10 @@ async function activate(context) {
     copyUrl: async () => { await client.ensure(); await vscode.env.clipboard.writeText('http://127.0.0.1:' + client.port + '/v1'); vscode.window.showInformationMessage('已复制 Trae 基础请求地址，完整 URL 开关请关闭'); },
     export: exportCsv
   })) context.subscriptions.push(vscode.commands.registerCommand('deepseekTokenMeter.' + name, guard(action)));
-  if (settings.get('autoStart', true)) { try { await client.ensure(); } catch (error) { vscode.window.showWarningMessage('DeepSeek 本机代理：' + error.message); } }
+  try {
+    if (settings.get('autoStart', true)) await client.ensure();
+    else await client.syncVersion();
+  } catch (error) { vscode.window.showWarningMessage('DeepSeek 本机代理：' + error.message); }
   await refresh();
   watchChanges();
   // The proxy pushes after every committed write, so this heartbeat only keeps the daemon alive
@@ -61,10 +64,8 @@ function watchChanges() {
   unwatch = client.watch(
     () => { refresh().catch(() => {}); },
     event => {
-      // A dropped stream is the only case where pushes can be missed; refresh once when it goes
-      // down so the panel shows the proxy as stopped, and once when it reconnects.
-      if (event === 'down') { streamUp = false; refresh().catch(() => {}); }
-      else if (!streamUp) { streamUp = true; refresh().catch(() => {}); }
+      // Refresh on disconnect to reflect proxy status; the stream's `ready` event resyncs on open.
+      if (event === 'down') refresh().catch(() => {});
     }
   );
 }
@@ -75,11 +76,13 @@ function stopWatching() { unwatch?.(); unwatch = undefined; }
 const refresh = createRefreshQueue(async () => {
   maintainHolidays().catch(() => {});
   try {
-    const state = await client.state(lastQuery);
-    const today = lastQuery.range === 'today' && !lastQuery.model ? state : await client.state({ range: 'today' });
-    status.text = (state.service.running ? '$(pulse) ' : '$(debug-pause) ') + 'DeepSeek · ' + compact(today.totals.total) + ' T';
-    status.tooltip = '今日已记录 ' + today.totals.requests + ' 次调用；' + (state.service.running ? '本机代理运行中' : '本机代理已停止') + '\n点击打开统计面板';
-    panel?.webview.postMessage({ type: 'state', value: state });
+    const summary = await client.summary();
+    status.text = (summary.service.running ? '$(pulse) ' : '$(debug-pause) ') + 'DeepSeek · ' + compact(summary.totals.total) + ' T';
+    status.tooltip = '今日已记录 ' + summary.totals.requests + ' 次调用；' + (summary.service.running ? '本机代理运行中' : '本机代理已停止') + '\n点击打开统计面板';
+    if (panel?.visible) {
+      const state = await client.state(lastQuery, panelIncludeHeatmap);
+      panel.webview.postMessage({ type: 'state', value: state });
+    }
   } catch (error) { if (panel) panel.webview.postMessage({ type: 'error', message: error.message }); status.text = '$(warning) DeepSeek'; }
 });
 
@@ -87,6 +90,7 @@ async function openPanel(context) {
   if (panel) { panel.reveal(); await refresh(); return; }
   panel = vscode.window.createWebviewPanel('deepseekTokenMeter.dashboard', 'DeepSeek 本机用量', vscode.ViewColumn.One,
     { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')] });
+  panel.onDidChangeViewState(event => { if (event.webviewPanel.visible) refresh().catch(() => {}); }, null, context.subscriptions);
   const webview = panel.webview;
   const nonce = randomBytes(16).toString('hex');
   let html = await fs.readFile(path.join(context.extensionPath, 'media', 'dashboard.html'), 'utf8');
@@ -100,7 +104,11 @@ async function openPanel(context) {
   webview.onDidReceiveMessage(async message => {
     try {
       if (!message || typeof message.type !== 'string') return;
-      if (message.type === 'ready' || message.type === 'refresh') { if (message.query) lastQuery = sanitizeQuery(message.query); await refresh(); }
+      if (message.type === 'ready' || message.type === 'refresh') {
+        if (message.query) lastQuery = sanitizeQuery(message.query);
+        panelIncludeHeatmap = message.includeHeatmap === true;
+        await refresh();
+      }
       if (message.type === 'saveConfig') { await client.ensure(); await client.request('/_meter/config', 'POST', message.value); webview.postMessage({ type: 'saved' }); await refresh(); }
       if (message.type === 'start') { await client.ensure(); await refresh(); }
       if (message.type === 'stop') await vscode.commands.executeCommand('deepseekTokenMeter.stop');
