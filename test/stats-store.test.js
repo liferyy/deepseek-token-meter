@@ -101,6 +101,43 @@ test('peak and off-peak costs are split by request start time', async t => {
   assert.equal(result.totals.costOffPeak, 1);
   assert.equal(result.totals.cost, 3);
   assert.deepEqual(result.recent.items.map(e => e.peak), [false, true]);
+  assert.deepEqual(result.recent.items.map(e => e.cost.total), [1, 2]);
+});
+test('recent request costs include all billable token types and reprice historical usage', async t => {
+  const tokens = { input: 1000000, cacheRead: 2000000, cacheWrite: 3000000, output: 4000000, reasoning: 500000 };
+  const store = await memoryStore(t, [
+    event('recent-peak', '2026-10-26T02:00:00Z', { model: 'deepseek-v2', requestedModel: 'chat-alias', usage: tokens }),
+    event('recent-off', '2026-10-26T04:00:00Z', { model: 'deepseek-v2', requestedModel: 'chat-alias', usage: tokens })
+  ]);
+  const rates = { ...config, prices: [{ model: 'deepseek-*', input: 2, cacheRead: .2, cacheWrite: 3, output: 8 }] };
+  const result = summarize(store.db, rates, { includeHeatmap: false }, NOW);
+  const byId = new Map(result.recent.items.map(item => [item.id, item]));
+  assert.deepEqual(byId.get('recent-peak').cost, { input: 2, cacheRead: .4, cacheWrite: 9, output: 32, total: 43.4, peak: true });
+  assert.deepEqual(byId.get('recent-off').cost, { input: 1, cacheRead: .2, cacheWrite: 4.5, output: 16, total: 21.7, peak: false });
+  assert.ok(Math.abs(result.recent.items.reduce((sum, item) => sum + item.cost.total, 0) - result.totals.cost) < 1e-10);
+  const repriced = summarize(store.db, { ...rates, prices: [{ model: 'chat-alias', input: 4, cacheRead: .4, cacheWrite: 6, output: 16 }] },
+    { includeHeatmap: false }, NOW).recent.items;
+  assert.deepEqual(repriced.map(item => item.cost.total), [43.4, 86.8]);
+  assert.ok(store.allEvents().every(item => !Object.hasOwn(item, 'cost')));
+});
+test('recent request costs distinguish free, unpriced, unknown and partial usage', async t => {
+  const store = await memoryStore(t, [
+    event('free', '2026-10-26T02:00:00Z', { model: 'free-model' }),
+    event('unpriced', '2026-10-26T02:01:00Z', { model: 'unknown-model' }),
+    event('missing', '2026-10-26T02:02:00Z', { status: 'error', usage: null }),
+    event('partial', '2026-10-26T02:03:00Z', { status: 'cancelled', partial: true })
+  ]);
+  const rates = { ...config, prices: [...config.prices, { model: 'free-model', input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }] };
+  const result = summarize(store.db, rates, { includeHeatmap: false }, NOW);
+  const byId = new Map(result.recent.items.map(item => [item.id, item]));
+  assert.equal(byId.get('free').cost.total, 0);
+  assert.equal(byId.get('unpriced').cost, null);
+  assert.notEqual(byId.get('unpriced').usage, null);
+  assert.equal(byId.get('missing').cost, null);
+  assert.equal(byId.get('missing').usage, null);
+  assert.equal(byId.get('partial').partial, true);
+  assert.ok(Math.abs(byId.get('partial').cost.total - .00198) < 1e-10);
+  assert.ok(Math.abs(byId.get('partial').cost.total - result.totals.cost) < 1e-10);
 });
 test('missing, partial, cancelled and unpriced requests are transparent', async t => {
   const now = Date.parse('2026-10-26T10:00:00Z');

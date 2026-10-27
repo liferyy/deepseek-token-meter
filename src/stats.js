@@ -134,7 +134,7 @@ function bucketStatistics(buckets) {
   };
 }
 
-function recentPage(db, range, model, query) {
+function recentPage(db, range, model, query, prices) {
   const size = pageNumber(query.size, DEFAULT_RECENT_SIZE, 5, 200);
   const clause = 'started_at >= ? AND started_at < ?' + (model ? ' AND model = ?' : '');
   const params = model ? [range.from, range.to, model] : [range.from, range.to];
@@ -143,7 +143,10 @@ function recentPage(db, range, model, query) {
   const page = Math.min(pageNumber(query.page, 1, 1, 1000000), pages);
   const items = db.prepare('SELECT * FROM events WHERE ' + clause + ' ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?')
     .all(...params, size, (page - 1) * size)
-    .map(row => ({ ...rowToEvent(row), peak: isPeak(row.started_at) }));
+    .map(row => {
+      const event = rowToEvent(row), peak = isPeak(row.started_at);
+      return { ...event, peak, cost: costAt(event.usage, rateFor(prices, event.model, event.requestedModel), peak) };
+    });
   return { items, total, page, size, pages };
 }
 
@@ -222,7 +225,7 @@ function summarize(db, config, query = {}, now = Date.now()) {
   const heatmap = query.includeHeatmap === false || query.includeHeatmap === 'false'
     ? undefined : heatmapFor(db, config, query.model, today);
 
-  const recent = recentPage(db, range, query.model, query);
+  const recent = recentPage(db, range, query.model, query, config.prices);
   const allModels = db.prepare('SELECT DISTINCT model FROM events ORDER BY model').all().map(row => row.model);
   return { range, timezone: zone, totals, buckets, bucketStats: bucketStatistics(buckets),
     models: [...models.values()].sort((a, b) => b.total - a.total),

@@ -11,7 +11,7 @@
   let toastTimer, resizeTimer, pendingSave;
   const short = n => n >= 1e9 ? (n / 1e9).toFixed(2) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n || 0);
   const number = n => Number(n || 0).toLocaleString('zh-CN');
-  const money = n => '¥' + Number(n || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: n > 0 && n < .01 ? 6 : 4 });
+  const money = n => n > 0 && n < .000001 ? '<¥0.000001' : '¥' + Number(n || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: n > 0 && n < .01 ? 6 : 4 });
   const post = (type, data = {}) => bridge?.postMessage({ type, ...data });
   function node(tag, text, className) { const n = document.createElement(tag); if (text != null) n.textContent = text; if (className) n.className = className; return n; }
   function svg(tag, attrs = {}, text) { const n = document.createElementNS(svgNS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v)); if (text != null) n.textContent = text; return n; }
@@ -194,7 +194,7 @@
     $('recent-rows').replaceChildren();
     if (!recent.items.length) {
       const tr = node('tr'), td = node('td', '当前筛选条件下没有请求记录。', 'recent-empty');
-      td.colSpan = 7; tr.append(td); $('recent-rows').append(tr);
+      td.colSpan = 8; tr.append(td); $('recent-rows').append(tr);
     }
     for (const event of recent.items) {
       const tr = node('tr');
@@ -208,7 +208,16 @@
       tr.append(info);
       const status = node('td', event.status === 'success' ? '成功' : event.status === 'cancelled' ? '已取消' : '异常');
       status.className = event.status === 'success' ? 'success-label' : 'error-label'; status.title = event.errorCode || ('HTTP ' + event.httpStatus); tr.append(status);
-      const tokens = node('td', event.usage ? short(event.usage.total) + (event.partial ? '（部分）' : '') : '用量未知'); if (!event.usage) tokens.className = 'unknown-label'; tr.append(tokens, node('td', (event.durationMs / 1000).toFixed(1) + 's')); $('recent-rows').append(tr);
+      const tokens = node('td', event.usage ? short(event.usage.total) + (event.partial ? '（部分）' : '') : '用量未知'); if (!event.usage) tokens.className = 'unknown-label';
+      const cost = node('td', event.cost ? money(event.cost.total) + (event.partial ? '（部分）' : '') : event.usage ? '未定价' : '—');
+      if (event.cost) {
+        cost.title = (event.peak ? '高峰时段' : '空闲时段（单价 × 50%）') + ' · ' + priceKeys.map(key => labels[key] + ' ' + money(event.cost[key])).join(' · ')
+          + (event.partial ? '\n仅按已收到的部分 usage 估算，实际费用可能更高。' : '\n按当前模型单价估算。');
+      } else {
+        cost.className = 'unknown-label';
+        cost.title = event.usage ? '请在“模型定价”中为 ' + event.model + ' 配置单价。' : '未收到 usage，无法估算本次费用。';
+      }
+      tr.append(tokens, cost, node('td', (event.durationMs / 1000).toFixed(1) + 's')); $('recent-rows').append(tr);
     }
     $('recent-total').textContent = '共 ' + number(recent.total) + ' 条 · 每页 ' + recent.size + ' 条';
     $('page-label').textContent = recent.page + ' / ' + recent.pages;
