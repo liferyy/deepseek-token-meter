@@ -114,6 +114,29 @@ function recentPage(db, range, model, query) {
   return { items, total, page, size, pages };
 }
 
+// The activity grid always scans 365 days, which is the most expensive part of every refresh.
+// A dashboard can refresh after each push (at most once every three seconds), so the grid is
+// reused for a short window; it only shows a day's totals, which do not visibly change that fast.
+const HEATMAP_TTL_MS = 10000;
+const heatmapCache = new WeakMap();
+function heatmapFor(db, config, model, today, now) {
+  const key = config.timezone + '|' + (model || '') + '|' + today + '|' + Math.floor(now / HEATMAP_TTL_MS);
+  const cached = heatmapCache.get(db);
+  if (cached?.key === key) return cached.value;
+  const zone = config.timezone;
+  const heatFrom = midnight(shiftDate(today, -370), zone);
+  const heatTo = midnight(shiftDate(today, 1), zone);
+  const map = new Map();
+  for (const row of groupedRows(db, 'meter_day(started_at, ?)', [zone], heatFrom, heatTo, model)) {
+    if (!map.has(row.bucket)) map.set(row.bucket, blank({ date: row.bucket }));
+    accumulateGroup(map.get(row.bucket), row, config.prices);
+  }
+  const value = [];
+  for (let date = shiftDate(today, -364); date <= today; date = shiftDate(date, 1)) value.push(map.get(date) || blank({ date }));
+  heatmapCache.set(db, { key, value });
+  return value;
+}
+
 function summarize(db, config, query = {}, now = Date.now()) {
   const zone = config.timezone;
   const range = makeRange(query, zone, now);
@@ -150,15 +173,7 @@ function summarize(db, config, query = {}, now = Date.now()) {
   totals.cacheHitRate = totals.prompt ? totals.cacheRead / totals.prompt : null;
 
   const today = dateKey(now, zone);
-  const heatMap = new Map();
-  const heatFrom = midnight(shiftDate(today, -370), zone);
-  const heatTo = midnight(shiftDate(today, 1), zone);
-  for (const row of groupedRows(db, 'meter_day(started_at, ?)', [zone], heatFrom, heatTo, query.model)) {
-    if (!heatMap.has(row.bucket)) heatMap.set(row.bucket, blank({ date: row.bucket }));
-    accumulateGroup(heatMap.get(row.bucket), row, config.prices);
-  }
-  const heatmap = [];
-  for (let key = shiftDate(today, -364); key <= today; key = shiftDate(key, 1)) heatmap.push(heatMap.get(key) || blank({ date: key }));
+  const heatmap = heatmapFor(db, config, query.model, today, now);
 
   const recent = recentPage(db, range, query.model, query);
   const allModels = db.prepare('SELECT DISTINCT model FROM events ORDER BY model').all().map(row => row.model);

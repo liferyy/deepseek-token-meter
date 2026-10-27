@@ -8,8 +8,9 @@ const { ServiceClient } = require('./service-client');
 const { refresh: refreshHolidays, load: loadHolidays, needsRefresh: holidaysNeedRefresh } = require('./holidays');
 const { dateKey } = require('./time');
 const { RECENT_SIZES, DEFAULT_RECENT_SIZE } = require('./stats');
+const { createRefreshQueue } = require('./refresh-queue');
 
-let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, refreshPromise, unwatch, streamUp = true;
+let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, unwatch, streamUp = true;
 // The holiday cache covers whole years; check at most once a day (and every six hours after a
 // failure), so a window left open across New Year picks up the new year immediately.
 const HOLIDAY_RETRY_MS = 6 * 60 * 60 * 1000;
@@ -69,20 +70,18 @@ function watchChanges() {
 }
 function stopWatching() { unwatch?.(); unwatch = undefined; }
 
-async function refresh() {
-  if (refreshPromise) return refreshPromise;
-  refreshPromise = (async () => {
-    maintainHolidays().catch(() => {});
-    try {
-      const state = await client.state(lastQuery);
-      const today = lastQuery.range === 'today' && !lastQuery.model ? state : await client.state({ range: 'today' });
-      status.text = (state.service.running ? '$(pulse) ' : '$(debug-pause) ') + 'DeepSeek · ' + compact(today.totals.total) + ' T';
-      status.tooltip = '今日已记录 ' + today.totals.requests + ' 次调用；' + (state.service.running ? '本机代理运行中' : '本机代理已停止') + '\n点击打开统计面板';
-      panel?.webview.postMessage({ type: 'state', value: state });
-    } catch (error) { if (panel) panel.webview.postMessage({ type: 'error', message: error.message }); status.text = '$(warning) DeepSeek'; }
-  })();
-  try { await refreshPromise; } finally { refreshPromise = null; }
-}
+// A push can arrive while a refresh is still running (a request usually produces one). The queue
+// repeats the refresh afterwards so a single write is never lost now that nothing polls.
+const refresh = createRefreshQueue(async () => {
+  maintainHolidays().catch(() => {});
+  try {
+    const state = await client.state(lastQuery);
+    const today = lastQuery.range === 'today' && !lastQuery.model ? state : await client.state({ range: 'today' });
+    status.text = (state.service.running ? '$(pulse) ' : '$(debug-pause) ') + 'DeepSeek · ' + compact(today.totals.total) + ' T';
+    status.tooltip = '今日已记录 ' + today.totals.requests + ' 次调用；' + (state.service.running ? '本机代理运行中' : '本机代理已停止') + '\n点击打开统计面板';
+    panel?.webview.postMessage({ type: 'state', value: state });
+  } catch (error) { if (panel) panel.webview.postMessage({ type: 'error', message: error.message }); status.text = '$(warning) DeepSeek'; }
+});
 
 async function openPanel(context) {
   if (panel) { panel.reveal(); await refresh(); return; }
