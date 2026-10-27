@@ -55,6 +55,12 @@ function status() {
 
 function isHoliday(date) { return offDays.has(date); }
 function isMakeupWorkday(date) { return makeupWorkdays.has(date); }
+// Holiday files cover whole years. A window left open across New Year would otherwise keep
+// pricing the new year with weekend rules only, so callers check this before long-running use.
+function needsRefresh(now = Date.now()) {
+  const year = dateKey(now, 'Asia/Shanghai').slice(0, 4);
+  return !snapshot.days.some(day => day.date.startsWith(year + '-'));
+}
 
 async function writeCache(file, value) {
   const temp = file + '.' + randomBytes(5).toString('hex') + '.tmp';
@@ -160,4 +166,4 @@ async function refresh(directory, now = Date.now()) {
   }
 }
 
-module.exports = { SOURCES, CACHE_FILE, LOCK_FILE, apply, load, refresh, status, isHoliday, isMakeupWorkday };
+module.exports = { SOURCES, CACHE_FILE, LOCK_FILE, apply, load, refresh, status, needsRefresh, isHoliday, isMakeupWorkday };

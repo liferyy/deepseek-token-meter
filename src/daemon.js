@@ -26,7 +26,8 @@ async function main() {
     onError: message => { if (!store.warnings.includes(message)) store.warnings.push(message); } });
   await new Promise((resolve, reject) => { meter.server.once('error', reject); meter.server.listen(port, '127.0.0.1', resolve); });
   process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
-  // The extension polls while open; the service exits after ten idle minutes without clients.
+  // The editor keeps the daemon alive with a cheap health heartbeat while it is running; without
+  // one (window closed, extension disabled, host crashed) the service exits after ten idle minutes.
   setInterval(() => { if (!meter.active && Date.now() - meter.lastActivity > 600000) shutdown(); }, 30000).unref();
 }
 if (require.main === module) main().catch(() => { process.exitCode = 1; });

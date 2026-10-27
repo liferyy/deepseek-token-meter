@@ -46,7 +46,7 @@ function cleanEvent(value) {
     status: value.status, httpStatus: Number.isInteger(value.httpStatus) ? value.httpStatus : 0,
     durationMs: Number.isFinite(value.durationMs) ? Math.max(0, Math.round(value.durationMs)) : 0,
     endpoint: ['chat', 'responses', 'messages', 'completion'].includes(value.endpoint) ? value.endpoint : 'chat',
-    source: value.source === 'import' ? 'import' : 'proxy', partial: value.partial === true,
+    source: 'proxy', partial: value.partial === true,
     errorCode: typeof value.errorCode === 'string' ? value.errorCode.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60) : '',
     title: cleanText(value.title, 120), summary: cleanText(value.summary, 200), usage };
 }

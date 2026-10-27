@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { apply, load, refresh, status, isHoliday, isMakeupWorkday, LOCK_FILE } = require('../src/holidays');
+const { apply, load, refresh, status, needsRefresh, isHoliday, isMakeupWorkday, LOCK_FILE } = require('../src/holidays');
 
 test('holiday data is normalised and queried by date', () => {
   apply({ source: 'test', updatedAt: '2026-01-01T00:00:00Z', days: [
@@ -99,4 +99,13 @@ test('a stale lock left by a crashed window is reclaimed', async t => {
   assert.equal(info.skipped, undefined);
   assert.equal(calls, 2);
   await assert.rejects(fs.stat(lock), /ENOENT/);
+});
+
+test('a window left open across New Year asks for a refresh', () => {
+  apply({ source: 'test', updatedAt: '2026-01-01T00:00:00Z', days: [{ date: '2026-10-01', isOffDay: true }] });
+  assert.equal(needsRefresh(Date.parse('2026-10-26T02:00:00Z')), false);
+  // Beijing time crosses into the new year at 16:00 UTC; only then is the year missing.
+  assert.equal(needsRefresh(Date.parse('2026-12-31T15:59:00Z')), false);
+  assert.equal(needsRefresh(Date.parse('2026-12-31T16:00:00Z')), true);
+  assert.equal(needsRefresh(Date.parse('2027-03-01T02:00:00Z')), true);
 });

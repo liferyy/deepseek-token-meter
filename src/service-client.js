@@ -9,6 +9,14 @@ const { Store } = require('./store');
 const { summarize } = require('./stats');
 const { load: loadHolidays } = require('./holidays');
 
+// A stopped proxy is retried with a growing delay so a closed or broken endpoint does not get a
+// request every three seconds for as long as the editor stays open.
+const RETRY_MIN_MS = 3000;
+const RETRY_MAX_MS = 30000;
+function retryDelay(attempt) {
+  return Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** Math.max(0, Math.min(attempt, 4)));
+}
+
 class ServiceClient {
   constructor(directory, extensionPath, port) {
     this.directory = directory; this.extensionPath = extensionPath; this.port = port; this.token = ''; this.starting = null;
@@ -48,11 +56,19 @@ class ServiceClient {
   }
   // Subscribes to the proxy's change stream. The proxy pushes at most once every three seconds
   // after usage is committed, so open dashboards no longer need a short polling interval.
-  watch(onChange) {
-    let closed = false, request = null, retryTimer = null;
+  // `onStatus` reports 'open'/'down' transitions so the caller can refresh after a dropped stream.
+  watch(onChange, onStatus) {
+    let closed = false, request = null, retryTimer = null, attempt = 0, up = false;
+    const settle = () => {
+      if (!up) return;
+      up = false;
+      try { onStatus?.('down'); } catch { /* caller handles its own refresh */ }
+    };
     const schedule = () => {
-      if (closed || retryTimer) return;
-      retryTimer = setTimeout(() => { retryTimer = null; connect(); }, 3000);
+      if (closed) return;
+      settle();
+      if (retryTimer) return;
+      retryTimer = setTimeout(() => { retryTimer = null; connect(); }, retryDelay(attempt++));
       retryTimer.unref?.();
     };
     const connect = () => {
@@ -60,6 +76,8 @@ class ServiceClient {
       request = http.request({ hostname: '127.0.0.1', port: this.port, path: '/_meter/stream', method: 'GET',
         headers: { 'x-meter-token': this.token, accept: 'text/event-stream' } }, res => {
         if (res.statusCode !== 200) { res.resume(); schedule(); return; }
+        attempt = 0;
+        if (!up) { up = true; try { onStatus?.('open'); } catch { /* caller handles its own refresh */ } }
         let buffer = '';
         res.setEncoding('utf8');
         res.on('data', chunk => {
@@ -79,6 +97,10 @@ class ServiceClient {
     };
     connect();
     return () => { closed = true; clearTimeout(retryTimer); request?.destroy(); };
+  }
+  // Liveness only: no aggregation, so the editor heartbeat does not recompute the heatmap.
+  async ping() {
+    try { return await this.health(); } catch { return false; }
   }
   async health() {
     let result;
@@ -122,4 +144,4 @@ class ServiceClient {
   closeLocalStore() { if (this.localStore) { this.localStore.close(); this.localStore = null; } }
   close() { this.closeLocalStore(); }
 }
-module.exports = { ServiceClient };
+module.exports = { ServiceClient, retryDelay };

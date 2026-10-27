@@ -5,17 +5,35 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomBytes } = require('node:crypto');
 const { ServiceClient } = require('./service-client');
-const { refresh: refreshHolidays } = require('./holidays');
+const { refresh: refreshHolidays, load: loadHolidays, needsRefresh: holidaysNeedRefresh } = require('./holidays');
+const { dateKey } = require('./time');
 const { RECENT_SIZES, DEFAULT_RECENT_SIZE } = require('./stats');
 
-let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, refreshPromise, unwatch;
+let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, refreshPromise, unwatch, streamUp = true;
+// The holiday cache covers whole years; check at most once a day (and every six hours after a
+// failure), so a window left open across New Year picks up the new year immediately.
+const HOLIDAY_RETRY_MS = 6 * 60 * 60 * 1000;
+let holidayRetryAt = 0, holidayCheckedOn = '';
 function compact(n) { return n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n); }
+
+// Refreshes statutory holidays when the current year is missing, which happens when an editor
+// window stays open across New Year. refresh() itself is guarded by a cross-process lock.
+async function maintainHolidays() {
+  const today = dateKey(Date.now(), 'Asia/Shanghai');
+  if (today === holidayCheckedOn || Date.now() < holidayRetryAt) return;
+  holidayCheckedOn = today;
+  holidayRetryAt = Date.now() + HOLIDAY_RETRY_MS;
+  try {
+    await loadHolidays(client.directory);
+    if (!holidaysNeedRefresh()) return;
+    const result = await refreshHolidays(client.directory);
+    if (!result.skipped) await refresh();
+  } catch { /* keep the cached data and retry after the throttle window */ }
+}
 
 async function activate(context) {
   const settings = vscode.workspace.getConfiguration('deepseekTokenMeter');
   client = await new ServiceClient(context.globalStorageUri.fsPath, context.extensionPath, settings.get('port', 18765)).init();
-  // Refresh the statutory holiday data once per start; failures keep the cached file.
-  refreshHolidays(client.directory).catch(() => {});
   const tree = { getTreeItem: item => item, getChildren: () => [], onDidChangeTreeData: new vscode.EventEmitter().event };
   context.subscriptions.push(vscode.window.registerTreeDataProvider('deepseekTokenMeter.welcome', tree));
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
@@ -31,21 +49,30 @@ async function activate(context) {
   if (settings.get('autoStart', true)) { try { await client.ensure(); } catch (error) { vscode.window.showWarningMessage('DeepSeek 本机代理：' + error.message); } }
   await refresh();
   watchChanges();
-  // The proxy pushes after every committed write; this slow timer only refreshes the status bar
-  // while the proxy is stopped or the change stream is reconnecting.
-  refreshTimer = setInterval(() => refresh().catch(() => {}), 30000);
+  // The proxy pushes after every committed write, so this heartbeat only keeps the daemon alive
+  // (and detects a proxy that died) without re-aggregating the year-long heatmap every 30 seconds.
+  refreshTimer = setInterval(() => { client.ping().catch(() => {}); }, 30000);
   context.subscriptions.push({ dispose: () => { clearInterval(refreshTimer); stopWatching(); } });
 }
 
 function watchChanges() {
   stopWatching();
-  unwatch = client.watch(() => { refresh().catch(() => {}); });
+  unwatch = client.watch(
+    () => { refresh().catch(() => {}); },
+    event => {
+      // A dropped stream is the only case where pushes can be missed; refresh once when it goes
+      // down so the panel shows the proxy as stopped, and once when it reconnects.
+      if (event === 'down') { streamUp = false; refresh().catch(() => {}); }
+      else if (!streamUp) { streamUp = true; refresh().catch(() => {}); }
+    }
+  );
 }
 function stopWatching() { unwatch?.(); unwatch = undefined; }
 
 async function refresh() {
   if (refreshPromise) return refreshPromise;
   refreshPromise = (async () => {
+    maintainHolidays().catch(() => {});
     try {
       const state = await client.state(lastQuery);
       const today = lastQuery.range === 'today' && !lastQuery.model ? state : await client.state({ range: 'today' });
