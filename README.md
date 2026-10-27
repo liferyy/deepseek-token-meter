@@ -105,7 +105,7 @@ npm run package
 
 ## 数据与隐私
 
-数据目录由编辑器分配，可在面板“本地数据”中查看并打开，通常位于全局存储目录下的 `local-tools.deepseek-token-meter`：
+数据目录由编辑器分配，可在面板“本地数据”中查看并打开，通常位于全局存储目录下的 `lifer.deepseek-token-meter`：
 
 ```text
 usage.db              SQLite 数据库（用量记录；运行时可能有 -wal / -shm 文件）
