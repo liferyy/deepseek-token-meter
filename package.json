@@ -2,7 +2,7 @@
   "name": "deepseek-token-meter",
   "displayName": "DeepSeek 本机用量",
   "description": "为 Trae CN / VS Code 提供本地 DeepSeek API 代理、每日模型 Token 统计与人民币费用估算。",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "publisher": "local-tools",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://gitee.com/teddyFei/deepseek-token-meter.git" },

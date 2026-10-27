@@ -54,14 +54,25 @@ function cleanText(value, limit) {
 const PROMPT_PREVIEW_LIMIT = 80;
 const TEXT_BLOCK_TYPES = new Set(['text', 'input_text', 'output_text']);
 const TITLE_KEYS = ['title', 'name', 'conversation_title', 'session_title'];
+function stripSystemReminders(value) {
+  // Clients can inject these into user messages, including alongside the actual input.
+  return value.replace(/<system-reminder\b[^>]*>[\s\S]*?(?:<\/system-reminder\s*>|$)/gi, ' ').trim();
+}
 function contentPreview(content) {
   const blocks = Array.isArray(content) ? content : [content];
   let hint = '';
   for (const block of blocks) {
-    if (typeof block === 'string' && block.trim()) return block;
+    if (typeof block === 'string') {
+      const text = stripSystemReminders(block);
+      if (text) return text;
+      continue;
+    }
     if (!block || typeof block !== 'object') continue;
     const type = typeof block.type === 'string' ? block.type.toLowerCase() : '';
-    if (TEXT_BLOCK_TYPES.has(type) && typeof block.text === 'string' && block.text.trim()) return block.text;
+    if (TEXT_BLOCK_TYPES.has(type) && typeof block.text === 'string') {
+      const text = stripSystemReminders(block.text);
+      if (text) return text;
+    }
     if (!hint) {
       if (type.includes('image')) hint = '图片输入';
       else if (type.includes('audio')) hint = '音频输入';
@@ -71,8 +82,10 @@ function contentPreview(content) {
   }
   return hint;
 }
-function firstUserPreview(messages) {
-  for (const message of Array.isArray(messages) ? messages : []) {
+function latestUserPreview(messages) {
+  const values = Array.isArray(messages) ? messages : [];
+  for (let i = values.length - 1; i >= 0; i--) {
+    const message = values[i];
     if (message?.role !== 'user') continue;
     const preview = contentPreview(message.content);
     if (preview) return preview;
@@ -80,14 +93,15 @@ function firstUserPreview(messages) {
   return '';
 }
 function inputPreview(input) {
-  if (typeof input === 'string') return input;
-  for (const item of Array.isArray(input) ? input : []) {
-    if (typeof item === 'string' && item.trim()) return item;
+  if (typeof input === 'string') return contentPreview(input);
+  const values = Array.isArray(input) ? input : [];
+  for (let i = values.length - 1; i >= 0; i--) {
+    const item = values[i];
     if (item?.role === 'user') {
       const preview = contentPreview(item.content);
       if (preview) return preview;
     }
-    if (TEXT_BLOCK_TYPES.has(item?.type)) {
+    if (typeof item === 'string' || (!item?.role && TEXT_BLOCK_TYPES.has(item?.type))) {
       const preview = contentPreview(item);
       if (preview) return preview;
     }
@@ -95,7 +109,7 @@ function inputPreview(input) {
   return '';
 }
 function promptPreview(object) {
-  const raw = firstUserPreview(object.messages) || inputPreview(object.input) || contentPreview(object.prompt);
+  const raw = latestUserPreview(object.messages) || inputPreview(object.input) || contentPreview(object.prompt);
   if (!raw) return '';
   const sanitized = raw.slice(0, 512)
     .replace(/\bBearer\s+\S+/gi, 'Bearer [已隐藏]')
@@ -108,7 +122,7 @@ function promptPreview(object) {
     ? chars.slice(0, PROMPT_PREVIEW_LIMIT - 1).join('') + '…'
     : chars.join('');
 }
-// Persist a short, redacted excerpt from the first user input, never the full conversation.
+// Persist a short, redacted excerpt from the latest user input, skipping client reminders.
 function describeRequest(object) {
   const meta = object.metadata && typeof object.metadata === 'object' ? object.metadata : {};
   const candidate = [...TITLE_KEYS.map(key => object[key]), ...TITLE_KEYS.map(key => meta[key])]
