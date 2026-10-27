@@ -3,7 +3,7 @@
 // Default prices follow DeepSeek's peak-hour CNY pricing for deepseek-flash (cache write is free).
 const { isPeak, OFF_PEAK_FACTOR } = require('./peak');
 
-const DEFAULT_CONFIG = Object.freeze({ upstream: 'https://api.deepseek.com', timezone: 'Asia/Shanghai', includeUsage: false,
+const DEFAULT_CONFIG = Object.freeze({ upstream: 'https://api.deepseek.com', timezone: 'Asia/Shanghai', includeUsage: false, ignoreHolidays: false,
   prices: [{ model: 'deepseek-flash', input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 }] });
 const PRICE_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'];
 
@@ -29,7 +29,8 @@ function validateConfig(value, port) {
     }
     return result;
   });
-  return { upstream: upstream.toString().replace(/\/$/, ''), timezone: String(value.timezone), includeUsage: value.includeUsage === true, prices };
+  return { upstream: upstream.toString().replace(/\/$/, ''), timezone: String(value.timezone), includeUsage: value.includeUsage === true,
+    ignoreHolidays: value.ignoreHolidays === true, prices };
 }
 
 function rateFor(prices, model, requestedModel) {

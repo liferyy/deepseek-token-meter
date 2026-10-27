@@ -18,6 +18,19 @@ function listen(server) {
   });
 }
 function close(server) { return new Promise(resolve => server.close(resolve)); }
+function waitFor(check, timeout = 3000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = () => {
+      let value;
+      try { value = check(); } catch (error) { reject(error); return; }
+      if (value) { resolve(value); return; }
+      if (Date.now() - started > timeout) { reject(new Error('等待条件超时')); return; }
+      setTimeout(tick, 15);
+    };
+    tick();
+  });
+}
 function request(port, options = {}) {
   const body = options.body === undefined ? null : Buffer.from(typeof options.body === 'string' ? options.body : JSON.stringify(options.body));
   return new Promise((resolve, reject) => {
@@ -53,7 +66,7 @@ async function setup(t, options = {}) {
   const upstreamPort = await listen(upstream);
   await store.saveConfig({ ...DEFAULT_CONFIG, upstream: 'http://127.0.0.1:' + upstreamPort, ...options.config });
   const token = randomBytes(32).toString('hex');
-  const meter = createMeterServer({ store, token, port: 0, fingerprint: 'test' });
+  const meter = createMeterServer({ store, token, port: 0, fingerprint: 'test', pushInterval: options.pushInterval });
   const port = await listen(meter.server);
   t.after(async () => { await meter.close(); store.close(); await close(upstream); await fs.rm(directory, { recursive: true, force: true }); });
   return { store, meter, port, token, seen, received: () => received };
@@ -166,14 +179,13 @@ test('admin endpoints require the private token and never expose it', async t =>
   assert.equal(payload.service.running, true);
   assert.equal(payload.totals.requests, 0);
   assert.ok(!JSON.stringify(payload).includes(ctx.token));
-  await ctx.store.add({ id: 'backup_1', startedAt: '2026-10-26T09:00:00Z', model: 'deepseek-chat', status: 'success',
+  await ctx.store.add({ id: 'export_1', startedAt: '2026-10-26T09:00:00Z', model: 'deepseek-chat', status: 'success',
     usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0 } });
-  const backup = JSON.parse((await request(ctx.port, { path: '/_meter/backup', headers: { 'x-meter-token': ctx.token } })).body.toString('utf8'));
-  assert.equal(backup.format, 'deepseek-token-meter');
-  assert.deepEqual(backup.events.map(event => event.id), ['backup_1']);
   assert.equal((await request(ctx.port, { path: '/_meter/export', headers: { 'x-meter-token': ctx.token } })).status, 200);
-  assert.equal((await request(ctx.port, { method: 'POST', path: '/_meter/import', headers: { 'x-meter-token': ctx.token }, body: { format: 'other' } })).status, 400);
-  assert.equal((await request(ctx.port, { path: '/_meter/backup', headers: { 'x-meter-token': ctx.token.toUpperCase() } })).status, 401);
+  assert.equal((await request(ctx.port, { path: '/_meter/export', headers: { 'x-meter-token': ctx.token.toUpperCase() } })).status, 401);
+  // JSON backup/import were removed on purpose; those admin routes must not linger.
+  assert.equal((await request(ctx.port, { path: '/_meter/backup', headers: { 'x-meter-token': ctx.token } })).status, 404);
+  assert.equal((await request(ctx.port, { method: 'POST', path: '/_meter/import', headers: { 'x-meter-token': ctx.token }, body: { format: 'other' } })).status, 404);
 });
 
 test('client cancellation stops the upstream stream and records partial usage as cancelled', async t => {
@@ -204,6 +216,48 @@ test('client cancellation stops the upstream stream and records partial usage as
   assert.equal(event.errorCode, 'CLIENT_CANCELLED');
   assert.equal(event.partial, true);
   assert.equal(event.usage.total, 85);
+});
+
+test('proxy pushes throttled change events to dashboards after committed writes', async t => {
+  const ctx = await setup(t, {
+    pushInterval: 1000,
+    upstream: async (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ model: 'deepseek-chat', usage: { prompt_tokens: 10, completion_tokens: 5 } }));
+    }
+  });
+  let text = '';
+  const stream = http.get({ hostname: '127.0.0.1', port: ctx.port, path: '/_meter/stream', headers: { 'x-meter-token': ctx.token } }, res => {
+    assert.equal(res.statusCode, 200);
+    res.setEncoding('utf8');
+    res.on('data', chunk => { text += chunk; });
+  });
+  stream.once('error', () => {});
+  t.after(() => stream.destroy());
+  await waitFor(() => text.includes('event: ready'));
+  await request(ctx.port, { body: { model: 'deepseek-chat', messages: [] } });
+  await waitFor(() => (text.match(/event: change/g) || []).length === 1);
+  // A second write immediately afterwards is coalesced until the push interval has elapsed.
+  await request(ctx.port, { body: { model: 'deepseek-chat', messages: [] } });
+  assert.equal((text.match(/event: change/g) || []).length, 1);
+  await waitFor(() => (text.match(/event: change/g) || []).length === 2, 3000);
+  assert.equal(ctx.store.allEvents().length, 2);
+});
+
+test('clear requires the typed confirmation and keeps model prices', async t => {
+  const ctx = await setup(t, { upstream: async (_req, res) => { res.writeHead(200); res.end('{}'); } });
+  const event = id => ({ id, startedAt: '2026-10-26T09:00:00Z', model: 'deepseek-chat', status: 'success',
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0 } });
+  await ctx.store.add(event('clear_1'));
+  await ctx.store.add(event('clear_2'));
+  const wrong = await request(ctx.port, { method: 'POST', path: '/_meter/clear', headers: { 'x-meter-token': ctx.token }, body: { confirm: 'delete' } });
+  assert.equal(wrong.status, 400);
+  assert.equal(ctx.store.allEvents().length, 2);
+  const cleared = await request(ctx.port, { method: 'POST', path: '/_meter/clear', headers: { 'x-meter-token': ctx.token }, body: { confirm: '清空' } });
+  assert.equal(cleared.status, 200);
+  assert.equal(JSON.parse(cleared.body.toString('utf8')).removed, 2);
+  assert.equal(ctx.store.allEvents().length, 0);
+  assert.deepEqual(ctx.store.config.prices, DEFAULT_CONFIG.prices);
 });
 
 test('helpers reject hop-by-hop and browser/proxy-specific headers', () => {

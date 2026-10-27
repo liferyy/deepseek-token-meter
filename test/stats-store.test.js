@@ -59,9 +59,23 @@ test('ranges and DST keep daily bucket dates correct', async t => {
 });
 test('CSV includes per-day model splits, RMB labels and formula escaping', async t => {
   const store = await memoryStore(t, [event('a', '2026-10-26T09:00:00Z', { model: '=CMD()' }), event('b', '2026-10-25T15:59:00Z')]);
-  const csv = dailyCsv(store.db, config);
+  const csv = dailyCsv(store.db, config, { range: 'custom', from: '2026-10-25', to: '2026-10-26' }, NOW);
   assert.ok(csv.startsWith('\ufeff')); assert.match(csv, /人民币/); assert.match(csv, /其中高峰时段估算人民币/);
   assert.match(csv, /其中空闲时段估算人民币/); assert.match(csv, /'=CMD/); assert.match(csv, /2026-10-25/); assert.match(csv, /2026-10-26/);
+});
+test('CSV export follows the selected range and model', async t => {
+  const store = await memoryStore(t, [
+    event('a', '2026-10-25T09:00:00Z', { model: 'other' }),
+    event('b', '2026-10-26T09:00:00Z', { model: 'other' }),
+    event('c', '2026-10-26T10:00:00Z')
+  ]);
+  const csv = dailyCsv(store.db, config, { range: 'custom', from: '2026-10-26', to: '2026-10-26', model: 'other' }, NOW);
+  assert.match(csv, /2026-10-26/);
+  assert.doesNotMatch(csv, /2026-10-25/);
+  assert.doesNotMatch(csv, /"deepseek-chat"/);
+  const today = dailyCsv(store.db, config, { range: 'today' }, NOW);
+  assert.match(today, /2026-10-26/);
+  assert.doesNotMatch(today, /2026-10-25/);
 });
 test('SQLite store survives concurrent writes, dedup, restart and reprice', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-test-'));
@@ -78,7 +92,7 @@ test('SQLite store survives concurrent writes, dedup, restart and reprice', asyn
   assert.equal(restarted.allEvents().length, 30);
   await restarted.add(event('new_req', '2026-10-26T09:00:00Z'));
   const third = await open(); assert.equal(third.allEvents().length, 31); assert.deepEqual(third.config.prices, config.prices);
-  assert.deepEqual(await third.importEvents([third.allEvents()[0]]), { added: 0, skipped: 1 });
+  assert.equal(await third.add(third.allEvents()[0]), false);
   const result = summarize(third.db, { ...config, prices: config.prices.map(p => ({ ...p, output: 16 })) }, {}, Date.parse('2026-10-26T10:00:00Z'));
   assert.ok(result.totals.cost > summarize(third.db, config, {}, Date.parse('2026-10-26T10:00:00Z')).totals.cost);
 });
@@ -120,6 +134,23 @@ test('events older than one year are removed when the store starts', async t => 
   store.close();
   const restarted = await open();
   assert.deepEqual(restarted.allEvents().map(e => e.id), ['kept']);
+  assert.equal(Number(restarted.db.prepare('PRAGMA freelist_count').get().freelist_count), 0);
+});
+test('clearing all usage keeps configuration and reclaims free pages', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-clear-'));
+  const store = await new Store(directory, 18765, { now: () => NOW }).init();
+  t.after(async () => { store.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  await store.saveConfig(config);
+  for (let i = 0; i < 300; i++) await store.add(event('clear_' + i, '2026-10-26T09:00:00Z'));
+  assert.equal(store.allEvents().length, 300);
+  const file = path.join(directory, 'usage.db');
+  const before = (await fs.stat(file)).size;
+  assert.equal(store.clearAll(), 300);
+  assert.equal(store.allEvents().length, 0);
+  assert.deepEqual(store.config.prices, config.prices);
+  assert.equal(Number(store.db.prepare('PRAGMA auto_vacuum').get().auto_vacuum), 2);
+  assert.equal(Number(store.db.prepare('PRAGMA freelist_count').get().freelist_count), 0);
+  assert.ok((await fs.stat(file)).size <= before);
 });
 test('legacy JSONL files are imported into SQLite once and then removed', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-migrate-'));
@@ -137,21 +168,4 @@ test('legacy JSONL files are imported into SQLite once and then removed', async 
   const restarted = await open();
   assert.equal(restarted.allEvents().length, 2);
   assert.equal(restarted.warnings.length, 0);
-});
-test('import validates the whole file, dedups within the batch and keeps the import source', async t => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-import-'));
-  const opened = [];
-  const open = async () => { const store = await new Store(directory, 18765, { now: () => NOW }).init(); opened.push(store); return store; };
-  t.after(async () => { for (const store of opened) store.close(); await fs.rm(directory, { recursive: true, force: true }); });
-  const store = await open();
-  await assert.rejects(store.importEvents([event('bad/id', '2026-10-26T09:00:00Z')]), /记录 ID/);
-  assert.equal(store.allEvents().length, 0);
-  const values = Array.from({ length: 400 }, (_, i) => event('imp_' + i, '2026-' + (i % 2 ? '09' : '10') + '-0' + (i % 8 + 1) + 'T09:00:00Z'));
-  values.push(values[0]);
-  assert.deepEqual(await store.importEvents(values), { added: 400, skipped: 1 });
-  assert.equal(store.allEvents().length, 400);
-  assert.equal(store.allEvents().filter(e => e.source === 'import').length, 400);
-  const restarted = await open();
-  assert.equal(restarted.allEvents().length, 400);
-  assert.deepEqual(await restarted.importEvents(values), { added: 0, skipped: 401 });
 });

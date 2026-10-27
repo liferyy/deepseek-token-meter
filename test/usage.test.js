@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { normalizeUsage, UsageCollector } = require('../src/usage');
 const { costFor, rateFor, validateConfig, DEFAULT_CONFIG } = require('../src/config');
-const { isPeak } = require('../src/peak');
+const { isPeak, configure } = require('../src/peak');
 const { apply } = require('../src/holidays');
 
 // Holiday dates normally come from the cached holiday-cn file; tests seed them directly.
@@ -37,6 +37,16 @@ test('peak windows follow Beijing weekday hours and Chinese holidays', () => {
   assert.equal(isPeak(at('2025-10-09T02:00:00Z')), true); // 假期结束后的周四
   assert.equal(isPeak(at('2026-10-10T02:00:00Z')), true); // 周六调休上班
   assert.equal(isPeak(at('2026-10-11T02:00:00Z')), false); // 周日
+});
+test('manual fallback ignores holidays and makeup workdays', () => {
+  const at = value => Date.parse(value);
+  configure({ ignoreHolidays: true });
+  try {
+    assert.equal(isPeak(at('2026-10-01T02:00:00Z')), true); // 国庆节周四按普通工作日
+    assert.equal(isPeak(at('2026-10-10T02:00:00Z')), false); // 调休周六按周末
+    assert.equal(isPeak(at('2026-10-26T02:00:00Z')), true); // 普通周一
+    assert.equal(isPeak(at('2026-10-26T04:00:00Z')), false); // 午休仍空闲
+  } finally { configure({}); }
 });
 test('cached details fallback and unknown usage', () => {
   assert.equal(normalizeUsage({ prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 80 }, completion_tokens: 4 }).input, 20);
@@ -94,4 +104,5 @@ test('config validation rejects loopbacks, duplicate IDs and invalid prices', ()
   assert.throws(() => validateConfig({ ...DEFAULT_CONFIG, prices: [row, row] }, 18765), /重复/);
   assert.throws(() => validateConfig({ ...DEFAULT_CONFIG, upstream: 'https://user:password@api.deepseek.com' }, 18765));
   assert.equal(validateConfig({ ...DEFAULT_CONFIG }, 18765).upstream, 'https://api.deepseek.com');
+  assert.equal(validateConfig({ ...DEFAULT_CONFIG, ignoreHolidays: true }, 18765).ignoreHolidays, true);
 });

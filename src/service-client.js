@@ -41,10 +41,44 @@ class ServiceClient {
           else resolve(raw ? value : parsed);
         });
       });
-      req.setTimeout(route.endsWith('import') ? 120000 : 15000, () => req.destroy(new Error('本机代理响应超时')));
+      req.setTimeout(15000, () => req.destroy(new Error('本机代理响应超时')));
       req.once('error', reject);
       req.end(body);
     });
+  }
+  // Subscribes to the proxy's change stream. The proxy pushes at most once every three seconds
+  // after usage is committed, so open dashboards no longer need a short polling interval.
+  watch(onChange) {
+    let closed = false, request = null, retryTimer = null;
+    const schedule = () => {
+      if (closed || retryTimer) return;
+      retryTimer = setTimeout(() => { retryTimer = null; connect(); }, 3000);
+      retryTimer.unref?.();
+    };
+    const connect = () => {
+      if (closed) return;
+      request = http.request({ hostname: '127.0.0.1', port: this.port, path: '/_meter/stream', method: 'GET',
+        headers: { 'x-meter-token': this.token, accept: 'text/event-stream' } }, res => {
+        if (res.statusCode !== 200) { res.resume(); schedule(); return; }
+        let buffer = '';
+        res.setEncoding('utf8');
+        res.on('data', chunk => {
+          buffer += chunk;
+          let index;
+          while ((index = buffer.indexOf('\n\n')) >= 0) {
+            const block = buffer.slice(0, index); buffer = buffer.slice(index + 2);
+            if (/(?:^|\n)event: change(?:\r?\n|$)/.test(block)) { try { onChange(); } catch { /* handled by the caller */ } }
+          }
+          if (buffer.length > 65536) buffer = ''; // malformed or oversized frame
+        });
+        res.once('end', schedule);
+        res.once('error', schedule);
+      });
+      request.once('error', schedule);
+      request.end();
+    };
+    connect();
+    return () => { closed = true; clearTimeout(retryTimer); request?.destroy(); };
   }
   async health() {
     let result;

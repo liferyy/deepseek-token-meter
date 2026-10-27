@@ -70,17 +70,19 @@
     $('chart-summary').textContent = bucketStats.count
       ? '单位：Tokens · 有请求时段平均 ' + short(Math.round(bucketStats.average)) + ' / 中位数 ' + short(Math.round(bucketStats.median)) + '（' + bucketStats.count + ' 个时段）'
       : '单位：Tokens · 当前区间没有请求';
-    const holiday = value.holidays;
-    $('holiday-status').textContent = holiday && holiday.updatedAt
-      ? '法定节假日数据：' + formatDate(holiday.updatedAt) + ' 更新 · 覆盖 ' + (holiday.years.length ? holiday.years.join('、') : '—') + ' 年 · 来源 holiday-cn，启动插件时自动刷新'
-      : '法定节假日数据尚未获取，暂时只按周末与工作时间判断峰谷；联网启动插件后会自动写入本地缓存。';
+    const holiday = value.holidays, ignoreHolidays = value.config?.ignoreHolidays === true;
+    $('holiday-status').textContent = ignoreHolidays
+      ? '当前已手动切换为仅按双休日判断：忽略法定节假日与调休，只把周一至周五的工作时间视为高峰；关闭上方开关可恢复 holiday-cn 数据。'
+      : holiday && holiday.updatedAt
+        ? '法定节假日数据：' + formatDate(holiday.updatedAt) + ' 更新 · 覆盖 ' + (holiday.years.length ? holiday.years.join('、') : '—') + ' 年 · 来源 holiday-cn，启动插件时自动刷新'
+        : '法定节假日数据尚未获取，暂时只按周末与工作时间判断峰谷；联网启动插件后会自动写入本地缓存，也可开启上方手动兜底。';
     $('page-size').value = String(query.size);
     const selected = $('model-filter').value || query.model;
     $('model-filter').replaceChildren(node('option', '全部模型'));
     $('model-filter').firstChild.value = '';
     for (const model of value.allModels) { const option = node('option', model); option.value = model; $('model-filter').append(option); }
     $('model-filter').value = selected;
-    if (!pricesDirty && !pendingSave) { prices = structuredClone(value.config.prices); renderPrices(); }
+    if (!pricesDirty && !pendingSave) { prices = structuredClone(value.config.prices); renderPrices(); $('ignore-holidays').checked = ignoreHolidays; }
     if (!settingsDirty && !pendingSave) {
       $('upstream').value = value.config.upstream; $('timezone').value = value.config.timezone; $('include-usage').checked = value.config.includeUsage;
     }
@@ -236,6 +238,7 @@
     if (kind === 'prices') {
       if (prices.some(row => !row.model.trim() || priceKeys.some(key => typeof row[key] !== 'number' || !Number.isFinite(row[key]) || row[key] < 0))) return notice('请填写完整的模型 ID 和非负高峰单价', true);
       config.prices = structuredClone(prices);
+      config.ignoreHolidays = $('ignore-holidays').checked;
     } else { config.upstream = $('upstream').value.trim(); config.timezone = $('timezone').value.trim(); config.includeUsage = $('include-usage').checked; }
     pendingSave = kind; $('save-prices').disabled = $('save-settings').disabled = true; post('saveConfig', { value: config });
   }
@@ -249,6 +252,10 @@
       pendingSave = null; $('save-prices').disabled = $('save-settings').disabled = false; notice('已保存，费用已按当前单价重新计算');
     }
     if (message.type === 'error') { pendingSave = null; $('save-prices').disabled = $('save-settings').disabled = false; notice(message.message, true); }
+    if (message.type === 'cleared') {
+      $('clear-confirm').hidden = true; $('clear-input').value = ''; $('clear-submit').disabled = true;
+      notice('已清空 ' + number(message.removed) + ' 条用量记录；模型单价与接入设置已保留');
+    }
     if (message.type === 'notice') notice(message.message);
   });
   for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => tab(button.dataset.tab));
@@ -266,11 +273,22 @@
   $('page-size').addEventListener('change', () => { query.size = Number($('page-size').value); query.page = 1; refresh(); });
   $('refresh').addEventListener('click', refresh);
   $('save-prices').addEventListener('click', () => saveConfig('prices')); $('save-settings').addEventListener('click', () => saveConfig('settings'));
+  $('ignore-holidays').addEventListener('change', () => { pricesDirty = true; });
   $('add-price').addEventListener('click', addPrice); $('new-model').addEventListener('keydown', e => { if (e.key === 'Enter') addPrice(); });
   for (const id of ['upstream', 'timezone', 'include-usage']) $(id).addEventListener('input', () => { settingsDirty = true; });
   $('toggle-service').addEventListener('click', () => post(state?.service.running ? 'stop' : 'start'));
   $('copy-url').addEventListener('click', () => post('copyUrl')); $('copy-full').addEventListener('click', () => post('copyUrl', { full: true }));
-  for (const type of ['export', 'backup', 'import']) $(type).addEventListener('click', () => post(type));
+  $('export').addEventListener('click', () => post('export', { query }));
+  $('clear-data').addEventListener('click', () => {
+    $('clear-confirm').hidden = false; $('clear-input').value = ''; $('clear-submit').disabled = true; $('clear-input').focus();
+  });
+  $('clear-input').addEventListener('input', () => { $('clear-submit').disabled = $('clear-input').value.trim() !== '清空'; });
+  $('clear-cancel').addEventListener('click', () => { $('clear-confirm').hidden = true; $('clear-input').value = ''; $('clear-submit').disabled = true; });
+  $('clear-submit').addEventListener('click', () => {
+    if ($('clear-input').value.trim() !== '清空') return;
+    $('clear-submit').disabled = true;
+    post('clear', { confirm: '清空' });
+  });
   $('open-data').addEventListener('click', () => post('openData')); $('empty-connect').addEventListener('click', () => tab('settings'));
   window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawChart, 100); });
   updateRangeButtons(); tab(saved.tab || 'overview'); if (query.from) $('date-from').value = query.from; if (query.to) $('date-to').value = query.to;

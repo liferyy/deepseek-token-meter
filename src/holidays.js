@@ -12,7 +12,11 @@ const SOURCES = [
   'https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/'
 ];
 const CACHE_FILE = 'holidays.json';
+const LOCK_FILE = 'holidays.lock';
 const TIMEOUT_MS = 8000;
+// A refresh takes at most two eight-second fetches. Locks older than this are treated as leftovers
+// from a crashed window, so a stale lock cannot disable refreshing forever.
+const LOCK_TTL_MS = 60000;
 
 let offDays = new Set();
 let makeupWorkdays = new Set();
@@ -91,19 +95,69 @@ async function fetchYear(year) {
   throw lastError;
 }
 
-// Fetches the current and next year (the next year is usually published in November) and merges
-// them into the cache. Failed years keep their previous values.
-async function refresh(directory, now = Date.now()) {
-  const year = Number(dateKey(now, 'Asia/Shanghai').slice(0, 4));
-  const results = await Promise.all([year, year + 1].map(value => fetchYear(value).catch(() => null)));
-  const fetched = results.filter(Boolean);
-  if (!fetched.length) throw new Error('无法获取法定节假日数据');
-  const days = snapshot.days.filter(day => !fetched.some(item => day.date.startsWith(item.year + '-')));
-  for (const item of fetched) days.push(...item.days);
-  const value = { version: 1, source: fetched[0].source, updatedAt: new Date(now).toISOString(), days };
-  apply(value);
-  if (directory && directory !== ':memory:') await writeCache(path.join(directory, CACHE_FILE), value);
-  return status();
+async function isStaleLock(file) {
+  let info;
+  try { info = await fs.stat(file); } catch (error) { return error.code === 'ENOENT'; }
+  if (Date.now() - info.mtimeMs > LOCK_TTL_MS) return true;
+  try {
+    const value = JSON.parse(await fs.readFile(file, 'utf8'));
+    if (Number.isInteger(value?.pid) && value.pid > 0) {
+      try { process.kill(value.pid, 0); } catch (error) { if (error.code === 'ESRCH') return true; }
+    }
+  } catch { /* an unreadable lock is handled by the TTL above */ }
+  return false;
 }
 
-module.exports = { SOURCES, CACHE_FILE, apply, load, refresh, status, isHoliday, isMakeupWorkday };
+// Editor windows belong to separate processes, so a lock file is the only shared coordination
+// point. `wx` makes creation atomic: exactly one window fetches, the others reuse the cache.
+async function acquireLock(directory) {
+  const file = path.join(directory, LOCK_FILE);
+  const token = randomBytes(8).toString('hex');
+  const payload = JSON.stringify({ pid: process.pid, at: Date.now(), token });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { await fs.writeFile(file, payload, { flag: 'wx', mode: 0o600 }); return token; }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (!(await isStaleLock(file))) return null;
+      await fs.unlink(file).catch(() => {});
+    }
+  }
+  return null;
+}
+
+async function releaseLock(directory, token) {
+  const file = path.join(directory, LOCK_FILE);
+  try {
+    const value = JSON.parse(await fs.readFile(file, 'utf8'));
+    if (value?.token === token) await fs.unlink(file);
+  } catch { /* already released, replaced or unreadable */ }
+}
+
+// Fetches the current and next year (the next year is usually published in November) and merges
+// them into the cache. Failed years keep their previous values. Another window holding the lock
+// makes this call a cache reload instead of a second network refresh.
+async function refresh(directory, now = Date.now()) {
+  const disk = Boolean(directory && directory !== ':memory:');
+  if (disk) await load(directory);
+  let lock = null;
+  if (disk) {
+    lock = await acquireLock(directory);
+    if (!lock) return { ...status(), skipped: true };
+  }
+  try {
+    const year = Number(dateKey(now, 'Asia/Shanghai').slice(0, 4));
+    const results = await Promise.all([year, year + 1].map(value => fetchYear(value).catch(() => null)));
+    const fetched = results.filter(Boolean);
+    if (!fetched.length) throw new Error('无法获取法定节假日数据');
+    const days = snapshot.days.filter(day => !fetched.some(item => day.date.startsWith(item.year + '-')));
+    for (const item of fetched) days.push(...item.days);
+    const value = { version: 1, source: fetched[0].source, updatedAt: new Date(now).toISOString(), days };
+    apply(value);
+    if (disk) await writeCache(path.join(directory, CACHE_FILE), value);
+    return status();
+  } finally {
+    if (lock) await releaseLock(directory, lock);
+  }
+}
+
+module.exports = { SOURCES, CACHE_FILE, LOCK_FILE, apply, load, refresh, status, isHoliday, isMakeupWorkday };

@@ -10,6 +10,9 @@ const { load: loadHolidays } = require('./holidays');
 const { version: VERSION } = require('../package.json');
 
 const PRODUCT = 'deepseek-token-meter';
+// Writes are pushed to every connected dashboard instead of being polled. Multiple records in a
+// burst are coalesced into one notification per interval so a fast stream does not flood windows.
+const PUSH_INTERVAL_MS = 3000;
 const HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length']);
 function json(res, status, object) {
   if (res.headersSent || res.destroyed) return;
@@ -74,10 +77,28 @@ function drained(stream) {
   });
 }
 
-function createMeterServer({ store, token, port, fingerprint = '', onShutdown = () => {}, onError = () => {} }) {
+function createMeterServer({ store, token, port, fingerprint = '', onShutdown = () => {}, onError = () => {}, pushInterval = PUSH_INTERVAL_MS }) {
   let active = 0, lastActivity = Date.now(), stopping = false;
   const agents = { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) };
   const sockets = new Set();
+  const streams = new Set();
+  let lastPushAt = 0, pushTimer = null;
+  const flushPush = () => {
+    pushTimer = null;
+    if (!streams.size) return;
+    lastPushAt = Date.now();
+    const payload = 'event: change\ndata: ' + JSON.stringify({ revision: store.revision }) + '\n\n';
+    for (const stream of streams) if (!stream.destroyed) stream.write(payload);
+  };
+  const notifyChanged = () => {
+    if (!streams.size) return;
+    const wait = pushInterval - (Date.now() - lastPushAt);
+    if (wait <= 0) {
+      if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; }
+      flushPush();
+    } else if (!pushTimer) pushTimer = setTimeout(flushPush, wait);
+    pushTimer?.unref?.();
+  };
   const server = http.createServer(async (req, res) => {
     lastActivity = Date.now();
     // This is a local reverse proxy, never an open forwarding proxy or a browser API.
@@ -88,6 +109,17 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
       if (url.pathname === '/_meter/health' && req.method === 'GET') return json(res, 200, { product: PRODUCT, version: VERSION, fingerprint, port });
       if (!authorized(req.headers['x-meter-token'], token)) return json(res, 401, { error: { message: '本机管理认证失败' } });
       try {
+        // Server-sent events: the proxy pushes one "change" notification after new records are
+        // committed. Editor windows keep this stream open instead of polling every few seconds.
+        if (req.method === 'GET' && url.pathname === '/_meter/stream') {
+          res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive' });
+          res.write('retry: 3000\n\nevent: ready\ndata: ' + JSON.stringify({ revision: store.revision }) + '\n\n');
+          streams.add(res);
+          const heartbeat = setInterval(() => { if (!res.destroyed) res.write(': ping\n\n'); }, 25000);
+          heartbeat.unref?.();
+          res.once('close', () => { clearInterval(heartbeat); streams.delete(res); });
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/_meter/state') {
           // Pick up holiday data refreshed by a newer editor window before recalculating peak/off-peak.
           const holidays = await loadHolidays(store.directory);
@@ -97,16 +129,22 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
         if (req.method === 'POST' && url.pathname === '/_meter/config') {
           const value = JSON.parse((await bodyOf(req, 512 * 1024)).toString('utf8'));
           if (active) return json(res, 409, { error: { message: '有请求正在进行，请结束后保存配置' } });
-          return json(res, 200, await store.saveConfig(value));
+          const config = await store.saveConfig(value);
+          notifyChanged();
+          return json(res, 200, config);
         }
         if (req.method === 'GET' && url.pathname === '/_meter/export') {
-          res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store' }); res.end(dailyCsv(store.db, store.config)); return;
+          res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store' });
+          res.end(dailyCsv(store.db, store.config, Object.fromEntries(url.searchParams)));
+          return;
         }
-        if (req.method === 'GET' && url.pathname === '/_meter/backup') return json(res, 200, { format: PRODUCT, version: 1, config: store.config, events: store.allEvents() });
-        if (req.method === 'POST' && url.pathname === '/_meter/import') {
-          const backup = JSON.parse((await bodyOf(req, 64 * 1024 * 1024)).toString('utf8'));
-          if (backup.format !== PRODUCT || backup.version !== 1) throw new Error('请选择本插件导出的 JSON 备份文件');
-          return json(res, 200, await store.importEvents(backup.events));
+        if (req.method === 'POST' && url.pathname === '/_meter/clear') {
+          if (active) return json(res, 409, { error: { message: '仍有 ' + active + ' 个请求正在进行，请结束后再清空数据' } });
+          const value = JSON.parse((await bodyOf(req, 4096)).toString('utf8'));
+          if (value?.confirm !== '清空') throw new Error('请输入“清空”以确认');
+          const removed = store.clearAll();
+          notifyChanged();
+          return json(res, 200, { removed });
         }
         if (req.method === 'POST' && url.pathname === '/_meter/stop') {
           if (active) return json(res, 409, { error: { message: '仍有 ' + active + ' 个请求正在进行，请结束后再停止代理' } });
@@ -131,10 +169,11 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
       saved = true;
       const usage = collector?.finish() || null;
       try {
-        await store.add({ id: randomUUID(), startedAt: new Date(started).toISOString(), requestedModel: model,
+        const added = await store.add({ id: randomUUID(), startedAt: new Date(started).toISOString(), requestedModel: model,
           model: collector?.model || model, status, httpStatus: statusCode, durationMs: Date.now() - started,
           endpoint: endpoint === 'chat/completions' ? 'chat' : endpoint === 'completions' ? 'completion' : endpoint,
           title: info.title, summary: info.summary, usage, partial: Boolean(usage && status !== 'success'), errorCode });
+        if (added) notifyChanged();
       } catch { onError('用量记录写入失败，请检查数据目录和磁盘空间'); }
     };
     const close = () => {
@@ -207,7 +246,15 @@ function createMeterServer({ store, token, port, fingerprint = '', onShutdown = 
   server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
   server.on('clientError', (_error, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); });
   return { server, get active() { return active; }, get lastActivity() { return lastActivity; },
-    async close() { for (const agent of Object.values(agents)) agent.destroy(); for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); await store.flush(); } };
+    async close() {
+      if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; }
+      for (const stream of streams) stream.destroy();
+      streams.clear();
+      for (const agent of Object.values(agents)) agent.destroy();
+      for (const socket of sockets) socket.destroy();
+      await new Promise(resolve => server.close(resolve));
+      await store.flush();
+    } };
 }
 
 module.exports = { createMeterServer, upstreamTarget, headersFor, describeRequest, PRODUCT };

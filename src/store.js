@@ -8,6 +8,7 @@ const { randomBytes } = require('node:crypto');
 const { DEFAULT_CONFIG, validateConfig } = require('./config');
 const { openDatabase, insertEvent, transaction, INSERT_SQL } = require('./db');
 const { load: loadHolidays } = require('./holidays');
+const { configure: configurePeak } = require('./peak');
 const { rowToEvent } = require('./stats');
 
 const RETENTION_MS = 365 * 86400000;
@@ -64,6 +65,7 @@ class Store {
   }
   async init() {
     if (this.memory) {
+      configurePeak(this.config);
       this.db = openDatabase(':memory:');
       this.insert = this.db.prepare(INSERT_SQL);
       return this;
@@ -75,15 +77,39 @@ class Store {
       if (error.code !== 'ENOENT') throw new Error('本地配置读取失败，请检查 config.json：' + error.message);
       await atomicJson(path.join(this.directory, 'config.json'), this.config);
     }
+    configurePeak(this.config);
     this.db = openDatabase(path.join(this.directory, 'usage.db'));
     this.insert = this.db.prepare(INSERT_SQL);
     await this.importLegacyJsonl();
     this.pruneStale();
+    this.compact();
     return this;
   }
   // Only the last 365 days are kept; older rows are removed when the plugin (or proxy) starts.
   pruneStale(now = this.now()) {
     const removed = Number(this.db.prepare('DELETE FROM events WHERE started_at < ?').run(now - RETENTION_MS).changes);
+    if (removed) this.revision++;
+    return removed;
+  }
+  // DELETE only frees pages inside the file. This returns them to the operating system and refreshes
+  // planner statistics; it is bounded so a very large database does not delay startup for long.
+  compact(maxPages = 200000) {
+    let free = Number(this.db.prepare('PRAGMA freelist_count').get()?.freelist_count ?? 0), freed = 0;
+    while (free > 0 && freed < maxPages) {
+      const step = Math.min(free, 1000);
+      this.db.exec('PRAGMA incremental_vacuum(' + step + ')');
+      const remaining = Number(this.db.prepare('PRAGMA freelist_count').get()?.freelist_count ?? 0);
+      if (remaining >= free) break; // incremental mode was not enabled; avoid an endless loop
+      freed += free - remaining; free = remaining;
+    }
+    this.db.exec('PRAGMA optimize');
+    return freed;
+  }
+  // Removes all usage rows but keeps the upstream URL, timezone, prices and holiday cache.
+  clearAll() {
+    const removed = Number(this.db.prepare('DELETE FROM events').run().changes);
+    try { this.db.exec('VACUUM'); } catch { this.compact(); }
+    this.db.exec('PRAGMA optimize');
     if (removed) this.revision++;
     return removed;
   }
@@ -121,20 +147,9 @@ class Store {
     const config = validateConfig(value, this.port);
     if (!this.memory) await atomicJson(path.join(this.directory, 'config.json'), config);
     this.config = config;
+    configurePeak(config);
     this.revision++;
     return config;
-  }
-  async importEvents(values) {
-    if (!Array.isArray(values) || values.length > 50000) throw new Error('每次最多导入 50,000 条本插件格式的用量记录');
-    // Validate the whole file before touching the database so a bad row cannot cause a partial import.
-    const events = values.map(value => ({ ...cleanEvent(value), source: 'import' }));
-    const added = transaction(this.db, () => {
-      let count = 0;
-      for (const event of events) count += insertEvent(this.insert, event);
-      return count;
-    });
-    if (added) this.revision++;
-    return { added, skipped: values.length - added };
   }
   allEvents() { return this.db.prepare('SELECT * FROM events ORDER BY started_at').all().map(rowToEvent); }
   async flush() { /* SQLite commits synchronously; kept for the shutdown sequence. */ }

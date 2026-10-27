@@ -15,6 +15,17 @@ function freePort() {
     server.listen(0, '127.0.0.1', () => { const { port } = server.address(); server.close(() => resolve(port)); });
   });
 }
+function waitFor(check, timeout = 2000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = () => {
+      if (check()) { resolve(); return; }
+      if (Date.now() - started > timeout) { reject(new Error('等待条件超时')); return; }
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
 
 test('stopped proxy keeps one local store across status polls instead of reopening the database', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-client-'));
@@ -60,4 +71,22 @@ test('health rejects a different program already listening on the configured por
   await new Promise(resolve => server.listen(client.port, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   await assert.rejects(client.health(), /已被其他程序占用/);
+});
+
+test('change stream delivers proxy pushes and stops cleanly', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'meter-client-'));
+  const client = await new ServiceClient(directory, path.join(__dirname, '..'), await freePort()).init();
+  const server = http.createServer((req, res) => {
+    assert.equal(req.url, '/_meter/stream');
+    assert.equal(req.headers['x-meter-token'], client.token);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: ready\ndata: {"revision":0}\n\n');
+    setTimeout(() => res.write('event: change\ndata: {"revision":1}\n\n'), 20);
+  });
+  await new Promise(resolve => server.listen(client.port, '127.0.0.1', resolve));
+  let count = 0;
+  const stop = client.watch(() => { count++; });
+  t.after(async () => { stop(); client.close(); await new Promise(resolve => server.close(resolve)); await fs.rm(directory, { recursive: true, force: true }); });
+  await waitFor(() => count > 0);
+  assert.equal(count, 1);
 });

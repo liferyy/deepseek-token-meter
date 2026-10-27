@@ -28,6 +28,8 @@
       <div class="section-top"><div><h2>Token 定价</h2><p>为不同模型设置单价，单位：人民币 / 百万 Tokens。</p></div><button class="primary" id="save-prices">保存定价</button></div>
       <div class="pricing-note">表内填写<strong>高峰时段</strong>单价，空闲时段自动按 50% 计算。高峰：北京时间周一至周五 09:00–12:00、14:00–18:00（中国法定节假日除外）；其余时段、周末与节假日全天为空闲。非缓存输入、缓存读取、缓存写入与输出独立计价，推理 Token 已包含在输出中。</div>
       <p class="field-hint" id="holiday-status">法定节假日数据：—</p>
+      <label class="checkbox-field"><input id="ignore-holidays" type="checkbox"> 手动兜底：忽略法定节假日与调休，仅按周一至周五的工作时间判断</label>
+      <p class="field-hint">节假日数据获取失败，或实际放假、调休安排与数据源不一致时开启。保存后会按新规则重新计算历史请求的高峰 / 空闲归属与费用估算。</p>
       <div class="price-unit"><span>模型单价</span><span>CNY / 1M TOKENS</span></div>
       <div class="table-scroll price-table"><table><thead><tr><th>模型 ID</th><th>输入价格（高峰）</th><th>输出价格（高峰）</th><th>缓存读取价格（高峰）</th><th>缓存写入价格（高峰）</th><th></th></tr></thead><tbody id="price-rows"></tbody></table></div>
       <div class="add-price"><input id="new-model" list="known-models" placeholder="输入模型 ID，例如 deepseek-chat" aria-label="新增模型 ID"><datalist id="known-models"></datalist><button id="add-price">＋ 添加模型</button></div>
@@ -38,9 +40,15 @@
       <div class="section-top"><div><h2>接入 DeepSeek</h2><p>把自定义模型接到本机代理，保留 Trae 原有的对话和工具调用。</p></div><button class="secondary" id="toggle-service">启动代理</button></div>
       <div class="setup-card"><div class="step-number">1</div><div class="step-content"><h3>复制本机请求地址</h3><div class="copy-line"><code id="base-url">http://127.0.0.1:18765/v1</code><button id="copy-url">复制地址</button></div><p>Trae → 设置 → 模型 → 添加模型 → 自定义模型</p></div></div>
       <div class="setup-card"><div class="step-number">2</div><div class="step-content"><h3>填写 Trae 自定义模型</h3><dl class="setup-fields"><dt>API 格式</dt><dd>OpenAI Chat Completions 格式</dd><dt>完整 URL</dt><dd>关闭，基础地址粘贴上方地址</dd><dt>模型 ID</dt><dd>填写 DeepSeek 平台支持的实际模型 ID</dd><dt>API 密钥</dt><dd>填写你自己的 DeepSeek API Key</dd></dl><p>如果开启“完整 URL”，请使用 <code id="full-url">http://127.0.0.1:18765/v1/chat/completions</code> <button class="text-button" id="copy-full">复制</button></p></div></div>
-      <div class="setup-card"><div class="step-number">3</div><div class="step-content"><h3>配置单价并发起对话</h3><p>在“模型定价”中设置人民币单价，完成 Trae 连通性测试后开始使用。连通性测试也是真实调用，会计入本机用量。</p><p class="field-hint">只统计经过该地址的请求。Trae 内置云端模型、其他电脑及直接调用官方地址的请求不会被自动记录。历史用量可导入本插件的备份。</p></div></div>
+      <div class="setup-card"><div class="step-number">3</div><div class="step-content"><h3>配置单价并发起对话</h3><p>在“模型定价”中设置人民币单价，完成 Trae 连通性测试后开始使用。连通性测试也是真实调用，会计入本机用量。</p><p class="field-hint">只统计经过该地址的请求。Trae 内置云端模型、其他电脑及直接调用官方地址的请求不会被自动记录。</p></div></div>
       <div class="settings-card"><div class="subheading"><h3>代理设置</h3><button class="primary" id="save-settings">保存设置</button></div><label class="field">上游 API 基础地址<input id="upstream" type="url" placeholder="https://api.deepseek.com"></label><p class="field-hint">默认直连 DeepSeek 官方 API。可填写兼容服务的基础地址，例如 https://example.com/v1；不要填写 /chat/completions，不在地址中放密钥。</p><label class="field">统计时区<input id="timezone" value="Asia/Shanghai" placeholder="Asia/Shanghai"></label><p class="field-hint">每日统计按此时区划分，默认北京时间；改变时区会重新汇总历史记录。</p><label class="checkbox-field"><input id="include-usage" type="checkbox"> 为流式请求补充 stream_options.include_usage</label><p class="field-hint">DeepSeek 官方接口本身会返回最终 usage，默认关闭。仅在兼容中转服务需要此参数时开启。</p></div>
-      <div class="settings-card"><div class="subheading"><h3>本地数据</h3><span>独立于当前项目</span></div><p id="data-directory" class="data-path"></p><div class="data-actions"><button id="backup">导出 JSON 备份</button><button id="import">导入备份</button><button id="open-data">打开数据目录</button></div><p class="field-hint">仅保存模型、时间、Token、状态和耗时，不保存 API Key、对话或响应正文。导入按记录 ID 去重，不覆盖当前单价；多个编辑器窗口共享同一个本机代理。</p></div>
+      <div class="settings-card"><div class="subheading"><h3>本地数据</h3><span>独立于当前项目</span></div><p id="data-directory" class="data-path"></p><div class="data-actions"><button id="open-data">打开数据目录</button><button id="clear-data" class="danger">清空数据</button></div>
+      <div class="clear-confirm" id="clear-confirm" hidden>
+        <p>将删除本机全部用量记录，模型单价与接入设置保留。此操作不可撤销。</p>
+        <label>请输入“清空”以确认：<input id="clear-input" autocomplete="off" spellcheck="false" placeholder="清空"></label>
+        <div class="clear-actions"><button id="clear-submit" class="danger" disabled>确认清空</button><button id="clear-cancel">取消</button></div>
+      </div>
+      <p class="field-hint">仅保存模型、时间、Token、状态和耗时，不保存 API Key、对话或响应正文；多个编辑器窗口共享同一个本机代理。</p></div>
     </section>
     <footer><span>DEEPSEEK LOCAL METER</span><span id="updated-at">等待本机数据</span></footer>
   </div>

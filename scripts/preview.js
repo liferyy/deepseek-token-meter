@@ -56,13 +56,14 @@ const bridge = `
     postMessage: async message => {
       try {
         if (message.type === 'copyUrl') { await navigator.clipboard.writeText('http://127.0.0.1:18765' + (message.full ? '/v1/chat/completions' : '/v1')); emit({ type: 'notice', message: '地址已复制；预览页面不提供模型代理' }); return; }
-        if (['import', 'openData'].includes(message.type)) { emit({ type: 'notice', message: '这是演示页面；请在安装后的插件中使用此功能' }); return; }
+        if (message.type === 'openData') { emit({ type: 'notice', message: '这是演示页面；请在安装后的插件中使用此功能' }); return; }
         const response = await fetch('/preview-api', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Preview-Token': '${token}' }, body: JSON.stringify({ ...message, empty, query: message.query || saved.query || { range: 'today' } }) });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error);
         if (data.download) download(data.download, data.name, data.mime);
         if (data.saved) emit({ type: 'saved' });
         if (data.state) emit({ type: 'state', value: data.state });
+        if (message.type === 'clear') emit({ type: 'cleared', removed: data.cleared || 0 });
       } catch (error) { emit({ type: 'error', message: error.message }); }
     }
   };
@@ -77,16 +78,18 @@ const server = http.createServer(async (req, res) => {
       if (req.headers['x-preview-token'] !== token) { res.writeHead(403).end(); return; }
       let body = '';
       for await (const chunk of req) { body += chunk; if (body.length > 512000) { res.writeHead(413).end(); return; } }
-      const message = JSON.parse(body), db = message.empty ? emptyStore.db : store.db;
+      const message = JSON.parse(body), active = message.empty ? emptyStore : store, db = active.db;
       if (message.type === 'saveConfig') config = validateConfig(message.value, 18765);
       if (message.type === 'stop') running = false;
       if (message.type === 'start') running = true;
+      let cleared = 0;
+      if (message.type === 'clear') cleared = active.clearAll();
       const state = { ...summarize(db, config, message.query), config,
         service: { running, active: 0, port: 18765, dataDirectory: '演示模式：数据仅在内存，不读取或写入真实用量' },
         warnings: ['演示数据与演示单价，仅用于预览界面；不代表真实消耗或官方价格。此端口不代理任何模型请求。'] };
       const result = { state, saved: message.type === 'saveConfig' };
-      if (message.type === 'export') Object.assign(result, { download: dailyCsv(db, config), name: 'DEMO-deepseek-daily.csv', mime: 'text/csv;charset=utf-8' });
-      if (message.type === 'backup') Object.assign(result, { download: JSON.stringify({ format: 'deepseek-token-meter-preview', demo: true, config, events: db.allEvents() }, null, 2), name: 'DEMO-preview.json', mime: 'application/json' });
+      if (message.type === 'clear') result.cleared = cleared;
+      if (message.type === 'export') Object.assign(result, { download: dailyCsv(db, config, message.query || { range: 'today' }), name: 'DEMO-deepseek-daily.csv', mime: 'text/csv;charset=utf-8' });
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' }).end(JSON.stringify(result)); return;
     }
     if (req.method !== 'GET') { res.writeHead(405).end(); return; }

@@ -167,9 +167,12 @@ function summarize(db, config, query = {}, now = Date.now()) {
     allModels, heatmap, recent, generatedAt: new Date(now).toISOString() };
 }
 
-function dailyCsv(db, config) {
+// The export follows the range and model filter currently shown in the panel; the same rows are
+// still grouped per local day and model.
+function dailyCsv(db, config, query = {}, now = Date.now()) {
+  const range = makeRange(query, config.timezone, now);
   const rows = new Map();
-  for (const row of groupedRows(db, 'meter_day(started_at, ?)', [config.timezone], null, null, null)) {
+  for (const row of groupedRows(db, 'meter_day(started_at, ?)', [config.timezone], range.from, range.to, query.model)) {
     const key = row.bucket + '\0' + row.model;
     if (!rows.has(key)) rows.set(key, blank({ date: row.bucket, model: row.model }));
     accumulateGroup(rows.get(key), row, config.prices);

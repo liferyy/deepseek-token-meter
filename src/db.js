@@ -46,6 +46,7 @@ function openDatabase(file) {
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = FULL');
   db.exec('PRAGMA busy_timeout = 5000');
+  configureAutoVacuum(db);
   db.exec(SCHEMA);
   const existing = new Set(db.prepare('PRAGMA table_info(events)').all().map(row => row.name));
   for (const [name, sql] of ADDED_COLUMNS) if (!existing.has(name)) db.exec(sql);
@@ -54,6 +55,18 @@ function openDatabase(file) {
   db.function('meter_peak', ms => (isPeak(Number(ms)) ? 1 : 0));
   db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(SCHEMA_VERSION);
   return db;
+}
+
+// Deleting expired rows only marks pages free; without incremental auto-vacuum the database file
+// would grow forever. auto_vacuum can only be enabled before the first table exists, so older
+// databases are rebuilt once (VACUUM). A busy database keeps the old mode and retries next start.
+function configureAutoVacuum(db) {
+  const mode = Number(db.prepare('PRAGMA auto_vacuum').get()?.auto_vacuum ?? 0);
+  if (mode === 2) return;
+  db.exec('PRAGMA auto_vacuum = INCREMENTAL');
+  const existing = db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'events'").get();
+  if (!existing) return;
+  try { db.exec('VACUUM'); } catch { /* another window is busy; the next start will retry */ }
 }
 
 function insertEvent(statement, event) {

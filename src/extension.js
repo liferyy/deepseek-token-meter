@@ -8,7 +8,7 @@ const { ServiceClient } = require('./service-client');
 const { refresh: refreshHolidays } = require('./holidays');
 const { RECENT_SIZES, DEFAULT_RECENT_SIZE } = require('./stats');
 
-let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, refreshPromise;
+let client, panel, status, refreshTimer, lastQuery = { range: 'today' }, refreshPromise, unwatch;
 function compact(n) { return n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n); }
 
 async function activate(context) {
@@ -30,9 +30,18 @@ async function activate(context) {
   })) context.subscriptions.push(vscode.commands.registerCommand('deepseekTokenMeter.' + name, guard(action)));
   if (settings.get('autoStart', true)) { try { await client.ensure(); } catch (error) { vscode.window.showWarningMessage('DeepSeek 本机代理：' + error.message); } }
   await refresh();
-  refreshTimer = setInterval(() => refresh().catch(() => {}), 5000);
-  context.subscriptions.push({ dispose: () => clearInterval(refreshTimer) });
+  watchChanges();
+  // The proxy pushes after every committed write; this slow timer only refreshes the status bar
+  // while the proxy is stopped or the change stream is reconnecting.
+  refreshTimer = setInterval(() => refresh().catch(() => {}), 30000);
+  context.subscriptions.push({ dispose: () => { clearInterval(refreshTimer); stopWatching(); } });
 }
+
+function watchChanges() {
+  stopWatching();
+  unwatch = client.watch(() => { refresh().catch(() => {}); });
+}
+function stopWatching() { unwatch?.(); unwatch = undefined; }
 
 async function refresh() {
   if (refreshPromise) return refreshPromise;
@@ -70,20 +79,12 @@ async function openPanel(context) {
       if (message.type === 'start') { await client.ensure(); await refresh(); }
       if (message.type === 'stop') await vscode.commands.executeCommand('deepseekTokenMeter.stop');
       if (message.type === 'copyUrl') { await vscode.env.clipboard.writeText('http://127.0.0.1:' + client.port + (message.full ? '/v1/chat/completions' : '/v1')); webview.postMessage({ type: 'notice', message: '请求地址已复制' }); }
-      if (message.type === 'export') await exportCsv();
-      if (message.type === 'backup') {
+      if (message.type === 'export') await exportCsv(message.query);
+      if (message.type === 'clear') {
         await client.ensure();
-        const uri = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(path.join(require('node:os').homedir(), 'deepseek-usage-backup.json')), filters: { JSON: ['json'] } });
-        if (uri) { await fs.writeFile(uri.fsPath, await client.request('/_meter/backup', 'GET', undefined, true)); webview.postMessage({ type: 'notice', message: '用量备份已保存（不含 API Key）' }); }
-      }
-      if (message.type === 'import') {
-        const uris = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { JSON: ['json'] } });
-        if (uris?.length) {
-          const stat = await fs.stat(uris[0].fsPath); if (stat.size > 64 * 1024 * 1024) throw new Error('单次导入文件不可超过 64 MB');
-          const backup = JSON.parse(await fs.readFile(uris[0].fsPath, 'utf8')); await client.ensure();
-          const result = await client.request('/_meter/import', 'POST', backup);
-          webview.postMessage({ type: 'notice', message: '导入 ' + result.added + ' 条，跳过重复 ' + result.skipped + ' 条；保留当前价格' }); await refresh();
-        }
+        const result = await client.request('/_meter/clear', 'POST', { confirm: typeof message.confirm === 'string' ? message.confirm : '' });
+        webview.postMessage({ type: 'cleared', removed: result.removed });
+        await refresh();
       }
       if (message.type === 'openData') await vscode.env.openExternal(vscode.Uri.file(client.directory));
     } catch (error) { webview.postMessage({ type: 'error', message: error.message }); }
@@ -95,12 +96,15 @@ function sanitizeQuery(query) {
   const size = RECENT_SIZES.includes(Number(query.size)) ? Number(query.size) : DEFAULT_RECENT_SIZE;
   return { range, model: typeof query.model === 'string' ? query.model.slice(0, 200) : '', from: typeof query.from === 'string' ? query.from.slice(0, 10) : '', to: typeof query.to === 'string' ? query.to.slice(0, 10) : '', page, size };
 }
-async function exportCsv() {
+async function exportCsv(query = lastQuery) {
   await client.ensure();
   const uri = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(path.join(require('node:os').homedir(), 'deepseek-daily-usage.csv')), filters: { CSV: ['csv'] } });
   if (!uri) return;
-  await fs.writeFile(uri.fsPath, await client.request('/_meter/export', 'GET', undefined, true), 'utf8');
-  vscode.window.showInformationMessage('每日模型用量已导出 CSV（人民币估算按当前单价）');
+  // Export the range and model currently selected in the panel instead of the whole history.
+  const selected = sanitizeQuery(query && typeof query === 'object' ? query : lastQuery);
+  const search = new URLSearchParams({ range: selected.range, model: selected.model, from: selected.from, to: selected.to });
+  await fs.writeFile(uri.fsPath, await client.request('/_meter/export?' + search, 'GET', undefined, true), 'utf8');
+  vscode.window.showInformationMessage('已按当前筛选导出每日模型用量 CSV（人民币估算按当前单价）');
 }
-function deactivate() { clearInterval(refreshTimer); client?.close(); }
+function deactivate() { clearInterval(refreshTimer); stopWatching(); client?.close(); }
 module.exports = { activate, deactivate, sanitizeQuery };
