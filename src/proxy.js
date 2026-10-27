@@ -54,23 +54,24 @@ function cleanText(value, limit) {
 const PROMPT_PREVIEW_LIMIT = 80;
 const TEXT_BLOCK_TYPES = new Set(['text', 'input_text', 'output_text']);
 const TITLE_KEYS = ['title', 'name', 'conversation_title', 'session_title'];
-function stripSystemReminders(value) {
-  // Clients can inject these into user messages, including alongside the actual input.
-  return value.replace(/<system-reminder\b[^>]*>[\s\S]*?(?:<\/system-reminder\s*>|$)/gi, ' ').trim();
+function cleanUserText(value) {
+  // Strip client reminders and user_input tags before redaction and truncation.
+  return value.replace(/<system-reminder\b[^>]*>[\s\S]*?(?:<\/system-reminder\s*>|$)/gi, ' ')
+    .replace(/<\/?user_input(?:\s[^>]*)?>/gi, ' ').trim();
 }
 function contentPreview(content) {
   const blocks = Array.isArray(content) ? content : [content];
   let hint = '';
   for (const block of blocks) {
     if (typeof block === 'string') {
-      const text = stripSystemReminders(block);
+      const text = cleanUserText(block);
       if (text) return text;
       continue;
     }
     if (!block || typeof block !== 'object') continue;
     const type = typeof block.type === 'string' ? block.type.toLowerCase() : '';
     if (TEXT_BLOCK_TYPES.has(type) && typeof block.text === 'string') {
-      const text = stripSystemReminders(block.text);
+      const text = cleanUserText(block.text);
       if (text) return text;
     }
     if (!hint) {
@@ -127,16 +128,8 @@ function describeRequest(object) {
   const meta = object.metadata && typeof object.metadata === 'object' ? object.metadata : {};
   const candidate = [...TITLE_KEYS.map(key => object[key]), ...TITLE_KEYS.map(key => meta[key])]
     .find(value => typeof value === 'string' && value.trim());
-  const messages = Array.isArray(object.messages) ? object.messages.length : Array.isArray(object.input) ? object.input.length : 0;
-  const tools = Array.isArray(object.tools) ? object.tools.length : 0;
-  const limit = object.max_tokens ?? object.max_completion_tokens;
   const preview = promptPreview(object);
-  const parts = [preview ? '请求：' + preview : '模型生成请求'];
-  if (messages) parts.push(messages + ' 条消息');
-  if (tools) parts.push(tools + ' 个工具');
-  if (object.stream === true) parts.push('流式输出');
-  if (Number.isInteger(limit) && limit > 0) parts.push('上限 ' + limit + ' Tokens');
-  return { title: cleanText(candidate, 120), summary: parts.join(' · ') };
+  return { title: cleanText(candidate, 120), summary: preview ? '请求：' + preview : '模型生成请求' };
 }
 function drained(stream) {
   if (stream.destroyed) return Promise.resolve();

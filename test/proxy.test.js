@@ -141,7 +141,7 @@ test('proxy records upstream HTTP failures without inventing token usage', async
   assert.equal(ctx.store.allEvents()[0].usage, null);
 });
 
-test('proxy records a bounded user excerpt with the explicit title and structural summary', async t => {
+test('proxy records a bounded user excerpt without client wrappers or structural metadata', async t => {
   const ctx = await setup(t, {
     upstream: async (_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -151,13 +151,13 @@ test('proxy records a bounded user excerpt with the explicit title and structura
   const response = await request(ctx.port, { body: { model: 'deepseek-chat', title: '  生成周报  ', stream: true, max_tokens: 384000,
     messages: [
       { role: 'system', content: 'SYSTEM-SECRET' },
-      { role: 'user', content: '请帮我总结这份周报，提炼关键进展和风险。USER-TAIL' },
+      { role: 'user', content: '<user_input>请帮我总结这份周报，提炼关键进展和风险。USER-TAIL</user_input>' },
       { role: 'assistant', content: 'ASSISTANT-SECRET' }
     ], tools: [{ type: 'function' }] } });
   assert.equal(response.status, 200);
   const event = ctx.store.allEvents()[0];
   assert.equal(event.title, '生成周报');
-  assert.equal(event.summary, '请求：请帮我总结这份周报，提炼关键进展和风险。USER-TAIL · 3 条消息 · 1 个工具 · 流式输出 · 上限 384000 Tokens');
+  assert.equal(event.summary, '请求：请帮我总结这份周报，提炼关键进展和风险。USER-TAIL');
   assert.ok(!JSON.stringify(ctx.store.allEvents()).includes('SYSTEM-SECRET'));
   assert.ok(!JSON.stringify(ctx.store.allEvents()).includes('ASSISTANT-SECRET'));
 });
@@ -174,20 +174,20 @@ test('proxy stores each latest user excerpt while forwarding reminders unchanged
     { role: 'user', content: reminder },
     { role: 'user', content: '解释项目结构。' },
     { role: 'assistant', content: 'ASSISTANT-SECRET' },
-    { role: 'user', content: reminder + '\n修复最近请求的概要。\n' + reminder },
+    { role: 'user', content: reminder + '\n<user_input>修复最近请求的概要。</user_input>\n' + reminder },
     { role: 'user', content: reminder }
   ] };
   const second = { ...first, messages: [...first.messages,
-    { role: 'user', content: '补上对应的回归测试。' }, { role: 'user', content: reminder }
+    { role: 'user', content: '<user_input>补上对应的回归测试。</user_input>' }, { role: 'user', content: reminder }
   ] };
   assert.equal((await request(ctx.port, { body: first })).status, 200);
   assert.equal((await request(ctx.port, { body: second })).status, 200);
   assert.deepEqual(ctx.seen.map(item => JSON.parse(item.body)), [first, second]);
   const events = ctx.store.allEvents();
   assert.deepEqual(events.map(event => event.summary).sort(), [
-    '请求：修复最近请求的概要。 · 5 条消息', '请求：补上对应的回归测试。 · 7 条消息'
+    '请求：修复最近请求的概要。', '请求：补上对应的回归测试。'
   ].sort());
-  assert.doesNotMatch(JSON.stringify(events), /system-reminder|maximum number of terminals|ASSISTANT-SECRET/);
+  assert.doesNotMatch(JSON.stringify(events), /user_input|system-reminder|maximum number of terminals|ASSISTANT-SECRET/);
 });
 
 test('request excerpts support text blocks, redact common secrets, cap length and identify multimodal input', () => {
@@ -199,7 +199,7 @@ test('request excerpts support text blocks, redact common secrets, cap length an
   assert.match(result.summary, /^请求：请分析日志里的 api_key=\[已隐藏\] 并检查 sk-\[已隐藏\]/);
   assert.ok(!result.summary.includes(apiKey));
   assert.ok(!result.summary.includes('SYSTEM-SECRET'));
-  assert.ok(Array.from(result.summary.slice('请求：'.length).split(' · ')[0]).length <= 80);
+  assert.ok(Array.from(result.summary.slice('请求：'.length)).length <= 80);
 
   const image = describeRequest({ messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://private.example/image.png' } }] }] });
   assert.match(image.summary, /^请求：图片输入/);
@@ -220,30 +220,32 @@ test('request excerpts select the latest user turn and skip trailing agent remin
     { role: 'assistant', content: 'LATEST-ASSISTANT-SECRET' }
   ];
   for (const key of ['messages', 'input']) {
-    assert.equal(describeRequest({ [key]: history }).summary, '请求：修复最近请求的概要。 · 8 条消息');
+    assert.equal(describeRequest({ [key]: history }).summary, '请求：修复最近请求的概要。');
     assert.equal(describeRequest({ [key]: [...history, { role: 'user', content: '补上对应的回归测试。' }, { role: 'user', content: reminder }] }).summary,
-      '请求：补上对应的回归测试。 · 10 条消息');
+      '请求：补上对应的回归测试。');
   }
 });
 
 test('request excerpts remove reminders within text and blocks before limiting length', () => {
   const reminder = '<SYSTEM-REMINDER source="agent">' + 'INTERNAL-SECRET '.repeat(100) + '</SYSTEM-REMINDER>';
   const text = '检查 api_key=private-value 并修复概要。';
-  const mixed = reminder + '\n' + text + '\n' + reminder;
+  const mixed = reminder + '\n<user_input>\n' + text + '\n</user_input>\n' + reminder;
   const formats = [
     { messages: [{ role: 'user', content: mixed }] },
     { messages: [{ role: 'user', content: [{ type: 'text', text: reminder }, { type: 'text', text: mixed }] }] },
+    { messages: [{ role: 'user', content: [{ type: 'text', text: '<user_input>' }, { type: 'text', text }, { type: 'text', text: '</user_input>' }] }] },
     { input: mixed },
     { input: [mixed, reminder] },
     { input: [{ role: 'user', content: [{ type: 'input_text', text: mixed }] }] },
     { input: [{ type: 'input_text', text: mixed }, { type: 'input_text', text: reminder }] },
+    { input: [{ type: 'input_text', text: '<user_input>' }, { type: 'input_text', text }, { type: 'input_text', text: '</user_input>' }] },
     { prompt: mixed },
     { prompt: [reminder, mixed] }
   ];
   for (const [index, body] of formats.entries()) {
     const result = describeRequest(body);
-    assert.ok(result.summary.startsWith('请求：检查 api_key=[已隐藏] 并修复概要。'), 'request format ' + index);
-    assert.doesNotMatch(result.summary, /reminder|INTERNAL-SECRET|private-value/i);
+    assert.equal(result.summary, '请求：检查 api_key=[已隐藏] 并修复概要。', 'request format ' + index);
+    assert.doesNotMatch(result.summary, /user_input|reminder|INTERNAL-SECRET|private-value/i);
   }
   assert.equal(describeRequest({ prompt: '保留真实输入。<system-reminder>未闭合的内部提醒' }).summary, '请求：保留真实输入。');
 });
@@ -256,16 +258,16 @@ test('reminder-only requests use a generic summary without exposing other roles'
     { role: 'user', content: reminder }
   ];
   for (const key of ['messages', 'input']) {
-    assert.equal(describeRequest({ [key]: history, stream: true }).summary, '模型生成请求 · 3 条消息 · 流式输出');
+    assert.equal(describeRequest({ [key]: history, stream: true }).summary, '模型生成请求');
   }
-  for (const body of [{ input: reminder }, { input: [reminder] }, { prompt: reminder }]) {
-    assert.match(describeRequest(body).summary, /^模型生成请求(?: · 1 条消息)?$/);
+  for (const body of [{ input: reminder }, { input: [reminder] }, { prompt: reminder }, { prompt: '<user_input>' + reminder + '</user_input>' }]) {
+    assert.equal(describeRequest(body).summary, '模型生成请求');
   }
   const image = describeRequest({ messages: [{ role: 'user', content: [
     { type: 'text', text: reminder },
     { type: 'image_url', image_url: { url: 'https://private.example/image.png' } }
   ] }] });
-  assert.equal(image.summary, '请求：图片输入 · 1 条消息');
+  assert.equal(image.summary, '请求：图片输入');
 });
 
 test('local-only guard, route validation and API key requirement run before any upstream call', async t => {
